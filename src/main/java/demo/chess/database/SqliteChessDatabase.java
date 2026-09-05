@@ -1,5 +1,6 @@
 package demo.chess.database;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -22,6 +23,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import demo.chess.definitions.engines.impl.NoMoveFoundException;
 import demo.chess.game.impl.Simulation;
@@ -33,7 +36,7 @@ import demo.chess.save.GameSaver;
  */
 public class SqliteChessDatabase implements ChessDatabase {
 
-    public static final int SCHEMA_VERSION = 1;
+    public static final int SCHEMA_VERSION = 2;
     public static final int HASH_VERSION = 1;
     public static final int MOVE_CODEC_VERSION = 1;
 
@@ -87,7 +90,8 @@ public class SqliteChessDatabase implements ChessDatabase {
         try (Connection connection = openConnection()) {
             long count;
             try (Statement statement = connection.createStatement();
-                    ResultSet resultSet = statement.executeQuery("SELECT COUNT(*) FROM game")) {
+                    ResultSet resultSet = statement.executeQuery(
+                            "SELECT COUNT(*) FROM game WHERE import_id IS NULL")) {
                 count = resultSet.next() ? resultSet.getLong(1) : 0L;
             }
 
@@ -108,153 +112,219 @@ public class SqliteChessDatabase implements ChessDatabase {
     }
 
     /**
-     * Imports one or more PGN games from a stream.
+     * Imports one or more PGN games as one isolated import unit.
      *
+     * @param importId stable import identifier
      * @param inputStream PGN stream
+     * @param totalBytes total source size, or a negative value when unknown
+     * @param progressConsumer progress callback
+     * @param cancellationRequested cancellation callback
      * @return import summary
      */
     @Override
-    public ImportResult importPgn(InputStream inputStream) throws SQLException, IOException {
+    public ImportResult importPgn(
+            String importId,
+            InputStream inputStream,
+            long totalBytes,
+            Consumer<ImportProgress> progressConsumer,
+            BooleanSupplier cancellationRequested) throws SQLException, IOException {
+        if (importId == null || importId.isBlank()) {
+            throw new IllegalArgumentException("importId must not be blank");
+        }
         if (inputStream == null) {
             throw new IllegalArgumentException("inputStream must not be null");
         }
 
+        Consumer<ImportProgress> safeProgressConsumer = progressConsumer == null
+                ? progress -> {
+                }
+                : progressConsumer;
+        BooleanSupplier safeCancellationRequested = cancellationRequested == null
+                ? () -> false
+                : cancellationRequested;
+
         Instant startedAt = Instant.now();
+        long processedGames = 0L;
         long importedGames = 0L;
         long skippedGames = 0L;
         long totalPlies = 0L;
         int pendingPositions = 0;
         Map<String, Long> playerCache = createPlayerCache();
+        CountingInputStream countingInputStream = new CountingInputStream(inputStream);
 
-        try (Connection connection = openConnection();
-                PgnStreamReader pgnReader = new PgnStreamReader(
-                        new InputStreamReader(inputStream, StandardCharsets.UTF_8));
-                PreparedStatement insertPlayer = connection.prepareStatement(
-                        "INSERT OR IGNORE INTO player(name, normalized_name) VALUES (?, ?)");
-                PreparedStatement selectPlayer = connection.prepareStatement(
-                        "SELECT id FROM player WHERE normalized_name = ?");
-                PreparedStatement insertGame = connection.prepareStatement(
-                        """
-                        INSERT INTO game(
-                            white_player_id, black_player_id, white_elo, black_elo,
-                            event, site, game_date, game_year, round, result, eco,
-                            ply_count, moves, tags
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """);
-                PreparedStatement upsertPosition = connection.prepareStatement(
-                        """
-                        INSERT INTO position_move(
-                            hash_hi, hash_lo, move_code, games, white_wins, draws, black_wins
-                        ) VALUES (?, ?, ?, 1, ?, ?, ?)
-                        ON CONFLICT(hash_hi, hash_lo, move_code) DO UPDATE SET
-                            games = games + 1,
-                            white_wins = white_wins + excluded.white_wins,
-                            draws = draws + excluded.draws,
-                            black_wins = black_wins + excluded.black_wins
-                        """)) {
+        publishProgress(
+                safeProgressConsumer,
+                countingInputStream,
+                totalBytes,
+                processedGames,
+                importedGames,
+                skippedGames,
+                totalPlies,
+                startedAt);
 
-            connection.setAutoCommit(false);
+        try {
+            try (Connection connection = openConnection();
+                    PgnStreamReader pgnReader = new PgnStreamReader(
+                            new InputStreamReader(countingInputStream, StandardCharsets.UTF_8));
+                    PreparedStatement insertPlayer = connection.prepareStatement(
+                            "INSERT OR IGNORE INTO player(name, normalized_name) VALUES (?, ?)");
+                    PreparedStatement selectPlayer = connection.prepareStatement(
+                            "SELECT id FROM player WHERE normalized_name = ?");
+                    PreparedStatement insertGame = connection.prepareStatement(
+                            """
+                            INSERT INTO game(
+                                white_player_id, black_player_id, white_elo, black_elo,
+                                event, site, game_date, game_year, round, result, eco,
+                                ply_count, moves, tags, import_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """);
+                    PreparedStatement upsertPosition = connection.prepareStatement(
+                            """
+                            INSERT INTO position_move_stage(
+                                import_id, hash_hi, hash_lo, move_code,
+                                games, white_wins, draws, black_wins
+                            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                            ON CONFLICT(import_id, hash_hi, hash_lo, move_code) DO UPDATE SET
+                                games = games + 1,
+                                white_wins = white_wins + excluded.white_wins,
+                                draws = draws + excluded.draws,
+                                black_wins = black_wins + excluded.black_wins
+                            """)) {
 
-            try {
-                String pgn;
-                while ((pgn = pgnReader.nextGame()) != null) {
-                    try {
-                        Map<String, String> tags = gameLoader.parsePgnTags(pgn);
-                        if (!isSupportedStandardGame(tags)) {
-                            skippedGames++;
-                            continue;
-                        }
+                connection.setAutoCommit(false);
 
-                        List<String> moves = gameLoader.parsePgnMoveList(pgn);
-                        if (moves.isEmpty()) {
-                            skippedGames++;
-                            continue;
-                        }
+                try {
+                    String pgn;
+                    while ((pgn = pgnReader.nextGame()) != null) {
+                        checkCancellation(safeCancellationRequested);
+                        processedGames++;
 
-                        List<PositionUpdate> positionUpdates = new ArrayList<>(moves.size());
-                        ZobristPositionHasher.Cursor cursor = ZobristPositionHasher.newCursor();
-                        for (String move : moves) {
-                            positionUpdates.add(new PositionUpdate(cursor.hash(), MoveCodec.encode(move)));
-                            cursor.apply(move);
-                        }
+                        try {
+                            Map<String, String> tags = gameLoader.parsePgnTags(pgn);
+                            if (!isSupportedStandardGame(tags)) {
+                                skippedGames++;
+                            } else {
+                                List<String> moves = gameLoader.parsePgnMoveList(pgn);
+                                if (moves.isEmpty()) {
+                                    skippedGames++;
+                                } else {
+                                    List<PositionUpdate> positionUpdates = new ArrayList<>(moves.size());
+                                    ZobristPositionHasher.Cursor cursor = ZobristPositionHasher.newCursor();
+                                    for (String move : moves) {
+                                        positionUpdates.add(new PositionUpdate(cursor.hash(), MoveCodec.encode(move)));
+                                        cursor.apply(move);
+                                    }
 
-                        Long whitePlayerId = findOrCreatePlayer(
-                                insertPlayer,
-                                selectPlayer,
-                                playerCache,
-                                tags.get("White"));
-                        Long blackPlayerId = findOrCreatePlayer(
-                                insertPlayer,
-                                selectPlayer,
-                                playerCache,
-                                tags.get("Black"));
+                                    Long whitePlayerId = findOrCreatePlayer(
+                                            insertPlayer,
+                                            selectPlayer,
+                                            playerCache,
+                                            tags.get("White"));
+                                    Long blackPlayerId = findOrCreatePlayer(
+                                            insertPlayer,
+                                            selectPlayer,
+                                            playerCache,
+                                            tags.get("Black"));
 
-                        bindNullableLong(insertGame, 1, whitePlayerId);
-                        bindNullableLong(insertGame, 2, blackPlayerId);
-                        bindNullableInteger(insertGame, 3, parseInteger(tags.get("WhiteElo")));
-                        bindNullableInteger(insertGame, 4, parseInteger(tags.get("BlackElo")));
-                        insertGame.setString(5, normalizeTag(tags.get("Event")));
-                        insertGame.setString(6, normalizeTag(tags.get("Site")));
+                                    bindNullableLong(insertGame, 1, whitePlayerId);
+                                    bindNullableLong(insertGame, 2, blackPlayerId);
+                                    bindNullableInteger(insertGame, 3, parseInteger(tags.get("WhiteElo")));
+                                    bindNullableInteger(insertGame, 4, parseInteger(tags.get("BlackElo")));
+                                    insertGame.setString(5, normalizeTag(tags.get("Event")));
+                                    insertGame.setString(6, normalizeTag(tags.get("Site")));
 
-                        String date = normalizeTag(tags.get("Date"));
-                        insertGame.setString(7, date);
-                        bindNullableInteger(insertGame, 8, parseYear(date));
+                                    String date = normalizeTag(tags.get("Date"));
+                                    insertGame.setString(7, date);
+                                    bindNullableInteger(insertGame, 8, parseYear(date));
 
-                        insertGame.setString(9, normalizeTag(tags.get("Round")));
-                        String result = normalizeResult(tags.get("Result"));
-                        insertGame.setString(10, result);
-                        insertGame.setString(11, normalizeTag(tags.get("ECO")));
-                        insertGame.setInt(12, moves.size());
-                        insertGame.setBytes(13, MoveCodec.encodeMoves(moves));
-                        insertGame.setString(14, encodeTags(tags));
-                        insertGame.executeUpdate();
+                                    insertGame.setString(9, normalizeTag(tags.get("Round")));
+                                    String result = normalizeResult(tags.get("Result"));
+                                    insertGame.setString(10, result);
+                                    insertGame.setString(11, normalizeTag(tags.get("ECO")));
+                                    insertGame.setInt(12, moves.size());
+                                    insertGame.setBytes(13, MoveCodec.encodeMoves(moves));
+                                    insertGame.setString(14, encodeTags(tags));
+                                    insertGame.setString(15, importId);
+                                    insertGame.executeUpdate();
 
-                        int whiteWin = "1-0".equals(result) ? 1 : 0;
-                        int draw = "1/2-1/2".equals(result) ? 1 : 0;
-                        int blackWin = "0-1".equals(result) ? 1 : 0;
+                                    int whiteWin = "1-0".equals(result) ? 1 : 0;
+                                    int draw = "1/2-1/2".equals(result) ? 1 : 0;
+                                    int blackWin = "0-1".equals(result) ? 1 : 0;
 
-                        for (PositionUpdate update : positionUpdates) {
-                            upsertPosition.setLong(1, update.hash().high());
-                            upsertPosition.setLong(2, update.hash().low());
-                            upsertPosition.setInt(3, update.moveCode());
-                            upsertPosition.setInt(4, whiteWin);
-                            upsertPosition.setInt(5, draw);
-                            upsertPosition.setInt(6, blackWin);
-                            upsertPosition.addBatch();
-                            pendingPositions++;
+                                    for (PositionUpdate update : positionUpdates) {
+                                        upsertPosition.setString(1, importId);
+                                        upsertPosition.setLong(2, update.hash().high());
+                                        upsertPosition.setLong(3, update.hash().low());
+                                        upsertPosition.setInt(4, update.moveCode());
+                                        upsertPosition.setInt(5, whiteWin);
+                                        upsertPosition.setInt(6, draw);
+                                        upsertPosition.setInt(7, blackWin);
+                                        upsertPosition.addBatch();
+                                        pendingPositions++;
 
-                            if (pendingPositions >= POSITION_BATCH_SIZE) {
-                                upsertPosition.executeBatch();
-                                pendingPositions = 0;
+                                        if (pendingPositions >= POSITION_BATCH_SIZE) {
+                                            upsertPosition.executeBatch();
+                                            pendingPositions = 0;
+                                        }
+                                    }
+
+                                    importedGames++;
+                                    totalPlies += moves.size();
+                                }
                             }
+                        } catch (NoMoveFoundException | IllegalArgumentException e) {
+                            skippedGames++;
                         }
 
-                        importedGames++;
-                        totalPlies += moves.size();
-
-                        if (importedGames % COMMIT_GAME_BATCH == 0) {
+                        if (processedGames % COMMIT_GAME_BATCH == 0) {
                             if (pendingPositions > 0) {
                                 upsertPosition.executeBatch();
                                 pendingPositions = 0;
                             }
                             connection.commit();
                         }
-                    } catch (NoMoveFoundException | IllegalArgumentException e) {
-                        skippedGames++;
-                    }
-                }
 
-                if (pendingPositions > 0) {
-                    upsertPosition.executeBatch();
+                        publishProgress(
+                                safeProgressConsumer,
+                                countingInputStream,
+                                totalBytes,
+                                processedGames,
+                                importedGames,
+                                skippedGames,
+                                totalPlies,
+                                startedAt);
+                    }
+
+                    checkCancellation(safeCancellationRequested);
+                    if (pendingPositions > 0) {
+                        upsertPosition.executeBatch();
+                    }
+
+                    finalizeImport(connection, importId);
+                    connection.commit();
+                } catch (SQLException | IOException | RuntimeException e) {
+                    connection.rollback();
+                    throw e;
                 }
-                connection.commit();
-            } catch (SQLException | IOException | RuntimeException e) {
-                connection.rollback();
-                throw e;
             }
+        } catch (ImportCancelledException e) {
+            cleanupImportAfterFailure(importId, e);
+            throw e;
+        } catch (SQLException | IOException | RuntimeException e) {
+            cleanupImportAfterFailure(importId, e);
+            throw e;
         }
 
         long elapsed = Duration.between(startedAt, Instant.now()).toMillis();
+        publishProgress(
+                safeProgressConsumer,
+                countingInputStream,
+                totalBytes,
+                processedGames,
+                importedGames,
+                skippedGames,
+                totalPlies,
+                startedAt);
         return new ImportResult(importedGames, skippedGames, totalPlies, elapsed);
     }
 
@@ -278,7 +348,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                 FROM game g
                 LEFT JOIN player w ON w.id = g.white_player_id
                 LEFT JOIN player b ON b.id = g.black_player_id
-                WHERE 1 = 1
+                WHERE g.import_id IS NULL
                 """);
         List<Object> parameters = new ArrayList<>();
 
@@ -346,7 +416,7 @@ public class SqliteChessDatabase implements ChessDatabase {
     public StoredGame getGame(long id) throws SQLException {
         try (Connection connection = openConnection();
                 PreparedStatement statement = connection.prepareStatement(
-                        "SELECT tags, moves FROM game WHERE id = ?")) {
+                        "SELECT tags, moves FROM game WHERE id = ? AND import_id IS NULL")) {
             statement.setLong(1, id);
             try (ResultSet resultSet = statement.executeQuery()) {
                 if (!resultSet.next()) {
@@ -414,7 +484,7 @@ public class SqliteChessDatabase implements ChessDatabase {
     }
 
     /**
-     * Initializes schema and format metadata.
+     * Initializes or migrates the schema and removes remnants from interrupted imports.
      */
     private void initialize() throws SQLException {
         try (Connection connection = openConnection();
@@ -429,6 +499,36 @@ public class SqliteChessDatabase implements ChessDatabase {
                         value TEXT NOT NULL
                     )
                     """);
+
+            int storedSchemaVersion = Integer.parseInt(readInfo(connection, "schema_version", "0"));
+            if (storedSchemaVersion > SCHEMA_VERSION) {
+                throw new SQLException(
+                        "Unsupported chess database schema version "
+                                + storedSchemaVersion
+                                + "; expected at most "
+                                + SCHEMA_VERSION);
+            }
+
+            String storedHashVersion = readInfo(connection, "hash_version", null);
+            if (storedHashVersion != null
+                    && Integer.parseInt(storedHashVersion) != HASH_VERSION) {
+                throw new SQLException(
+                        "Unsupported chess database hash version "
+                                + storedHashVersion
+                                + "; expected "
+                                + HASH_VERSION);
+            }
+
+            String storedMoveCodecVersion = readInfo(connection, "move_codec_version", null);
+            if (storedMoveCodecVersion != null
+                    && Integer.parseInt(storedMoveCodecVersion) != MOVE_CODEC_VERSION) {
+                throw new SQLException(
+                        "Unsupported chess database move codec version "
+                                + storedMoveCodecVersion
+                                + "; expected "
+                                + MOVE_CODEC_VERSION);
+            }
+
             statement.execute(
                     """
                     CREATE TABLE IF NOT EXISTS player(
@@ -455,10 +555,13 @@ public class SqliteChessDatabase implements ChessDatabase {
                         ply_count INTEGER NOT NULL,
                         moves BLOB NOT NULL,
                         tags TEXT NOT NULL,
+                        import_id TEXT,
                         FOREIGN KEY(white_player_id) REFERENCES player(id),
                         FOREIGN KEY(black_player_id) REFERENCES player(id)
                     )
                     """);
+            ensureColumn(connection, "game", "import_id", "TEXT");
+
             statement.execute(
                     """
                     CREATE TABLE IF NOT EXISTS position_move(
@@ -472,53 +575,201 @@ public class SqliteChessDatabase implements ChessDatabase {
                         PRIMARY KEY(hash_hi, hash_lo, move_code)
                     )
                     """);
+            statement.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS position_move_stage(
+                        import_id TEXT NOT NULL,
+                        hash_hi INTEGER NOT NULL,
+                        hash_lo INTEGER NOT NULL,
+                        move_code INTEGER NOT NULL,
+                        games INTEGER NOT NULL,
+                        white_wins INTEGER NOT NULL,
+                        draws INTEGER NOT NULL,
+                        black_wins INTEGER NOT NULL,
+                        PRIMARY KEY(import_id, hash_hi, hash_lo, move_code)
+                    )
+                    """);
 
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_white_player ON game(white_player_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_black_player ON game(black_player_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_year ON game(game_year)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_result ON game(result)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_eco ON game(eco)");
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_game_import_id ON game(import_id)");
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_position_stage_import_id ON position_move_stage(import_id)");
 
-            writeInfoIfAbsent(connection, "schema_version", Integer.toString(SCHEMA_VERSION));
             writeInfoIfAbsent(connection, "hash_version", Integer.toString(HASH_VERSION));
             writeInfoIfAbsent(connection, "move_codec_version", Integer.toString(MOVE_CODEC_VERSION));
             writeInfoIfAbsent(connection, "name", "Chess Database");
+            writeInfo(connection, "schema_version", Integer.toString(SCHEMA_VERSION));
 
-            int storedSchemaVersion = Integer.parseInt(readInfo(
-                    connection,
-                    "schema_version",
-                    Integer.toString(SCHEMA_VERSION)));
-            if (storedSchemaVersion != SCHEMA_VERSION) {
-                throw new SQLException(
-                        "Unsupported chess database schema version "
-                                + storedSchemaVersion
-                                + "; expected "
-                                + SCHEMA_VERSION);
-            }
+            cleanupStaleImports(connection);
+        }
+    }
 
-            int storedHashVersion = Integer.parseInt(readInfo(
-                    connection,
-                    "hash_version",
-                    Integer.toString(HASH_VERSION)));
-            if (storedHashVersion != HASH_VERSION) {
-                throw new SQLException(
-                        "Unsupported chess database hash version "
-                                + storedHashVersion
-                                + "; expected "
-                                + HASH_VERSION);
+    /**
+     * Ensures a column exists when migrating an older database.
+     *
+     * @param connection database connection
+     * @param table table name
+     * @param column column name
+     * @param definition SQL column definition
+     */
+    private void ensureColumn(
+            Connection connection,
+            String table,
+            String column,
+            String definition) throws SQLException {
+        boolean found = false;
+        try (Statement statement = connection.createStatement();
+                ResultSet resultSet = statement.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (resultSet.next()) {
+                if (column.equalsIgnoreCase(resultSet.getString("name"))) {
+                    found = true;
+                    break;
+                }
             }
+        }
+        if (!found) {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+            }
+        }
+    }
 
-            int storedMoveCodecVersion = Integer.parseInt(readInfo(
-                    connection,
-                    "move_codec_version",
-                    Integer.toString(MOVE_CODEC_VERSION)));
-            if (storedMoveCodecVersion != MOVE_CODEC_VERSION) {
-                throw new SQLException(
-                        "Unsupported chess database move codec version "
-                                + storedMoveCodecVersion
-                                + "; expected "
-                                + MOVE_CODEC_VERSION);
+    /**
+     * Removes staging rows left by an import that could not complete before process shutdown.
+     *
+     * @param connection database connection
+     */
+    private void cleanupStaleImports(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("DELETE FROM position_move_stage");
+            statement.executeUpdate("DELETE FROM game WHERE import_id IS NOT NULL");
+            statement.executeUpdate(
+                    """
+                    DELETE FROM player
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM game
+                        WHERE game.white_player_id = player.id OR game.black_player_id = player.id
+                    )
+                    """);
+        }
+    }
+
+    /**
+     * Atomically publishes one successfully staged import.
+     *
+     * @param connection database connection
+     * @param importId import identifier
+     */
+    private void finalizeImport(Connection connection, String importId) throws SQLException {
+        try (PreparedStatement mergePositions = connection.prepareStatement(
+                    """
+                    INSERT INTO position_move(
+                        hash_hi, hash_lo, move_code, games, white_wins, draws, black_wins
+                    )
+                    SELECT hash_hi, hash_lo, move_code, games, white_wins, draws, black_wins
+                    FROM position_move_stage
+                    WHERE import_id = ?
+                    ON CONFLICT(hash_hi, hash_lo, move_code) DO UPDATE SET
+                        games = games + excluded.games,
+                        white_wins = white_wins + excluded.white_wins,
+                        draws = draws + excluded.draws,
+                        black_wins = black_wins + excluded.black_wins
+                    """);
+                PreparedStatement publishGames = connection.prepareStatement(
+                        "UPDATE game SET import_id = NULL WHERE import_id = ?");
+                PreparedStatement deletePositions = connection.prepareStatement(
+                        "DELETE FROM position_move_stage WHERE import_id = ?")) {
+            mergePositions.setString(1, importId);
+            mergePositions.executeUpdate();
+            publishGames.setString(1, importId);
+            publishGames.executeUpdate();
+            deletePositions.setString(1, importId);
+            deletePositions.executeUpdate();
+        }
+    }
+
+    /**
+     * Removes all staged data belonging to one failed or cancelled import.
+     *
+     * @param importId import identifier
+     */
+    private void cleanupImport(String importId) throws SQLException {
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement deletePositions = connection.prepareStatement(
+                        "DELETE FROM position_move_stage WHERE import_id = ?");
+                    PreparedStatement deleteGames = connection.prepareStatement(
+                            "DELETE FROM game WHERE import_id = ?")) {
+                deletePositions.setString(1, importId);
+                deletePositions.executeUpdate();
+                deleteGames.setString(1, importId);
+                deleteGames.executeUpdate();
             }
+            try (Statement statement = connection.createStatement()) {
+                statement.executeUpdate(
+                        """
+                        DELETE FROM player
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM game
+                            WHERE game.white_player_id = player.id OR game.black_player_id = player.id
+                        )
+                        """);
+            }
+            connection.commit();
+        }
+    }
+
+    /**
+     * Cleans up a failed import without hiding the original failure.
+     *
+     * @param importId import identifier
+     * @param original original failure
+     */
+    private void cleanupImportAfterFailure(String importId, Exception original) {
+        try {
+            cleanupImport(importId);
+        } catch (SQLException cleanupFailure) {
+            original.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /**
+     * Throws when cancellation has been requested.
+     *
+     * @param cancellationRequested cancellation callback
+     */
+    private void checkCancellation(BooleanSupplier cancellationRequested) throws ImportCancelledException {
+        if (cancellationRequested.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+            throw new ImportCancelledException("Chess database import cancelled.");
+        }
+    }
+
+    /**
+     * Emits a progress snapshot.
+     */
+    private void publishProgress(
+            Consumer<ImportProgress> progressConsumer,
+            CountingInputStream inputStream,
+            long totalBytes,
+            long processedGames,
+            long importedGames,
+            long skippedGames,
+            long totalPlies,
+            Instant startedAt) {
+        try {
+            progressConsumer.accept(new ImportProgress(
+                    inputStream.bytesRead(),
+                    totalBytes,
+                    processedGames,
+                    importedGames,
+                    skippedGames,
+                    totalPlies,
+                    Duration.between(startedAt, Instant.now()).toMillis()));
+        } catch (RuntimeException ignored) {
+            // Progress reporting must never make the database import fail.
         }
     }
 
@@ -795,6 +1046,25 @@ public class SqliteChessDatabase implements ChessDatabase {
     }
 
     /**
+     * Writes or replaces one database metadata value.
+     *
+     * @param connection database connection
+     * @param key metadata key
+     * @param value metadata value
+     */
+    private void writeInfo(Connection connection, String key, String value) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                """
+                INSERT INTO database_info(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """)) {
+            statement.setString(1, key);
+            statement.setString(2, value);
+            statement.executeUpdate();
+        }
+    }
+
+    /**
      * Reads a database metadata value.
      *
      * @param connection database connection
@@ -873,5 +1143,65 @@ public class SqliteChessDatabase implements ChessDatabase {
      * @param moveCode compact encoded move
      */
     private record PositionUpdate(PositionHash hash, int moveCode) {
+    }
+
+    /**
+     * Input stream wrapper that counts source bytes consumed by the PGN reader.
+     */
+    private static final class CountingInputStream extends FilterInputStream {
+
+        private long bytesRead;
+
+        /**
+         * Creates the counting stream.
+         *
+         * @param inputStream wrapped stream
+         */
+        private CountingInputStream(InputStream inputStream) {
+            super(inputStream);
+        }
+
+        /**
+         * Returns the number of bytes consumed so far.
+         *
+         * @return consumed byte count
+         */
+        private long bytesRead() {
+            return bytesRead;
+        }
+
+        /**
+         * Counts one-byte reads.
+         */
+        @Override
+        public int read() throws IOException {
+            int value = super.read();
+            if (value >= 0) {
+                bytesRead++;
+            }
+            return value;
+        }
+
+        /**
+         * Counts block reads.
+         */
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            int count = super.read(buffer, offset, length);
+            if (count > 0) {
+                bytesRead += count;
+            }
+            return count;
+        }
+
+        /**
+         * Counts skipped bytes.
+         */
+        @Override
+        public long skip(long count) throws IOException {
+            long skipped = super.skip(count);
+            bytesRead += skipped;
+            return skipped;
+        }
     }
 }
