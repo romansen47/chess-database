@@ -53,6 +53,49 @@ class SqliteChessDatabaseTest {
     }
 
     /**
+     * Verifies repeated position/move keys are aggregated without losing result counts.
+     */
+    @Test
+    void aggregatesRepeatedPositionMoves() throws Exception {
+        String pgn = """
+                [Event "Aggregate One"]
+                [Site "?"]
+                [Date "2025.01.01"]
+                [Round "1"]
+                [White "White One"]
+                [Black "Black One"]
+                [Result "1-0"]
+
+                1. e4 e5 1-0
+
+                [Event "Aggregate Two"]
+                [Site "?"]
+                [Date "2025.01.02"]
+                [Round "2"]
+                [White "White Two"]
+                [Black "Black Two"]
+                [Result "0-1"]
+
+                1. e4 c5 0-1
+                """;
+
+        SqliteChessDatabase database = new SqliteChessDatabase(tempDirectory.resolve("aggregate.db"));
+        ImportResult result = database.importPgn(
+                new ByteArrayInputStream(pgn.getBytes(StandardCharsets.UTF_8)));
+
+        assertEquals(2, result.importedGames());
+        PositionStatistics initialPosition = database.findPosition(List.of(), 0);
+        assertEquals(1, initialPosition.moves().size());
+
+        PositionMoveStatistics e4 = initialPosition.moves().get(0);
+        assertEquals("e2e4", e4.move());
+        assertEquals(2, e4.games());
+        assertEquals(1, e4.whiteWins());
+        assertEquals(0, e4.draws());
+        assertEquals(1, e4.blackWins());
+    }
+
+    /**
      * Verifies cancellation removes the entire staged import and emits useful progress.
      */
     @Test
