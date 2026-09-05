@@ -4,6 +4,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.UUID;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import demo.chess.definitions.engines.impl.NoMoveFoundException;
 
@@ -20,12 +23,41 @@ public interface ChessDatabase {
     ChessDatabaseStatus getStatus() throws SQLException, IOException;
 
     /**
-     * Imports one or more PGN games from the supplied stream.
+     * Imports one or more PGN games from the supplied stream without progress reporting.
      *
      * @param inputStream PGN stream
      * @return completed import summary
      */
-    ImportResult importPgn(InputStream inputStream) throws SQLException, IOException;
+    default ImportResult importPgn(InputStream inputStream) throws SQLException, IOException {
+        return importPgn(
+                UUID.randomUUID().toString(),
+                inputStream,
+                -1L,
+                progress -> {
+                },
+                () -> false);
+    }
+
+    /**
+     * Imports one or more PGN games as an isolated import unit.
+     *
+     * <p>Games and position statistics remain invisible to normal database queries until the
+     * import has completed successfully. Cancellation or failure removes all staged data that
+     * belongs to the supplied import identifier.</p>
+     *
+     * @param importId stable identifier of the import job
+     * @param inputStream PGN stream
+     * @param totalBytes total source size, or a negative value when unknown
+     * @param progressConsumer receives running progress snapshots
+     * @param cancellationRequested returns true when the import should be cancelled
+     * @return completed import summary
+     */
+    ImportResult importPgn(
+            String importId,
+            InputStream inputStream,
+            long totalBytes,
+            Consumer<ImportProgress> progressConsumer,
+            BooleanSupplier cancellationRequested) throws SQLException, IOException;
 
     /**
      * Searches stored games.
