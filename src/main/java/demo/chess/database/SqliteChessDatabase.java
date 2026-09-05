@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +43,7 @@ public class SqliteChessDatabase implements ChessDatabase {
 
     private static final int COMMIT_GAME_BATCH = 1_000;
     private static final int POSITION_BATCH_SIZE = 5_000;
+    private static final int POSITION_AGGREGATION_LIMIT = 100_000;
     private static final int PLAYER_CACHE_SIZE = 10_000;
 
     private final Path databasePath;
@@ -144,12 +146,17 @@ public class SqliteChessDatabase implements ChessDatabase {
                 : cancellationRequested;
 
         Instant startedAt = Instant.now();
+        long importStartedNanos = System.nanoTime();
         long processedGames = 0L;
         long importedGames = 0L;
         long skippedGames = 0L;
         long totalPlies = 0L;
-        int pendingPositions = 0;
+        long parsingNanos = 0L;
+        long positionNanos = 0L;
+        long databaseNanos = 0L;
+        long finalizeNanos = 0L;
         Map<String, Long> playerCache = createPlayerCache();
+        Map<PositionMoveKey, PositionAggregate> positionAggregation = new HashMap<>(131_072);
         CountingInputStream countingInputStream = new CountingInputStream(inputStream);
 
         publishProgress(
@@ -183,9 +190,9 @@ public class SqliteChessDatabase implements ChessDatabase {
                             INSERT INTO position_move_stage(
                                 import_id, hash_hi, hash_lo, move_code,
                                 games, white_wins, draws, black_wins
-                            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(import_id, hash_hi, hash_lo, move_code) DO UPDATE SET
-                                games = games + 1,
+                                games = games + excluded.games,
                                 white_wins = white_wins + excluded.white_wins,
                                 draws = draws + excluded.draws,
                                 black_wins = black_wins + excluded.black_wins
@@ -194,27 +201,54 @@ public class SqliteChessDatabase implements ChessDatabase {
                 connection.setAutoCommit(false);
 
                 try {
-                    String pgn;
-                    while ((pgn = pgnReader.nextGame()) != null) {
+                    while (true) {
+                        long readStarted = System.nanoTime();
+                        String pgn = pgnReader.nextGame();
+                        parsingNanos += System.nanoTime() - readStarted;
+                        if (pgn == null) {
+                            break;
+                        }
+
                         checkCancellation(safeCancellationRequested);
                         processedGames++;
 
                         try {
-                            Map<String, String> tags = gameLoader.parsePgnTags(pgn);
-                            if (!isSupportedStandardGame(tags)) {
+                            Map<String, String> tags;
+                            List<String> moves;
+                            long parseStarted = System.nanoTime();
+                            try {
+                                tags = gameLoader.parsePgnTags(pgn);
+                                moves = isSupportedStandardGame(tags)
+                                        ? gameLoader.parsePgnMoveList(pgn)
+                                        : null;
+                            } finally {
+                                parsingNanos += System.nanoTime() - parseStarted;
+                            }
+
+                            if (moves == null || moves.isEmpty()) {
                                 skippedGames++;
                             } else {
-                                List<String> moves = gameLoader.parsePgnMoveList(pgn);
-                                if (moves.isEmpty()) {
-                                    skippedGames++;
-                                } else {
-                                    List<PositionUpdate> positionUpdates = new ArrayList<>(moves.size());
+                                List<PositionMoveKey> positionUpdates = new ArrayList<>(moves.size());
+                                byte[] encodedMoves;
+                                long positionStarted = System.nanoTime();
+                                try {
+                                    encodedMoves = MoveCodec.encodeMoves(moves);
                                     ZobristPositionHasher.Cursor cursor = ZobristPositionHasher.newCursor();
                                     for (String move : moves) {
-                                        positionUpdates.add(new PositionUpdate(cursor.hash(), MoveCodec.encode(move)));
+                                        PositionHash hash = cursor.hash();
+                                        positionUpdates.add(new PositionMoveKey(
+                                                hash.high(),
+                                                hash.low(),
+                                                MoveCodec.encode(move)));
                                         cursor.apply(move);
                                     }
+                                } finally {
+                                    positionNanos += System.nanoTime() - positionStarted;
+                                }
 
+                                String result = normalizeResult(tags.get("Result"));
+                                long databaseStarted = System.nanoTime();
+                                try {
                                     Long whitePlayerId = findOrCreatePlayer(
                                             insertPlayer,
                                             selectPlayer,
@@ -238,50 +272,51 @@ public class SqliteChessDatabase implements ChessDatabase {
                                     bindNullableInteger(insertGame, 8, parseYear(date));
 
                                     insertGame.setString(9, normalizeTag(tags.get("Round")));
-                                    String result = normalizeResult(tags.get("Result"));
                                     insertGame.setString(10, result);
                                     insertGame.setString(11, normalizeTag(tags.get("ECO")));
                                     insertGame.setInt(12, moves.size());
-                                    insertGame.setBytes(13, MoveCodec.encodeMoves(moves));
+                                    insertGame.setBytes(13, encodedMoves);
                                     insertGame.setString(14, encodeTags(tags));
                                     insertGame.setString(15, importId);
                                     insertGame.executeUpdate();
-
-                                    int whiteWin = "1-0".equals(result) ? 1 : 0;
-                                    int draw = "1/2-1/2".equals(result) ? 1 : 0;
-                                    int blackWin = "0-1".equals(result) ? 1 : 0;
-
-                                    for (PositionUpdate update : positionUpdates) {
-                                        upsertPosition.setString(1, importId);
-                                        upsertPosition.setLong(2, update.hash().high());
-                                        upsertPosition.setLong(3, update.hash().low());
-                                        upsertPosition.setInt(4, update.moveCode());
-                                        upsertPosition.setInt(5, whiteWin);
-                                        upsertPosition.setInt(6, draw);
-                                        upsertPosition.setInt(7, blackWin);
-                                        upsertPosition.addBatch();
-                                        pendingPositions++;
-
-                                        if (pendingPositions >= POSITION_BATCH_SIZE) {
-                                            upsertPosition.executeBatch();
-                                            pendingPositions = 0;
-                                        }
-                                    }
-
-                                    importedGames++;
-                                    totalPlies += moves.size();
+                                } finally {
+                                    databaseNanos += System.nanoTime() - databaseStarted;
                                 }
+
+                                int whiteWin = "1-0".equals(result) ? 1 : 0;
+                                int draw = "1/2-1/2".equals(result) ? 1 : 0;
+                                int blackWin = "0-1".equals(result) ? 1 : 0;
+
+                                long aggregationStarted = System.nanoTime();
+                                try {
+                                    aggregatePositionUpdates(
+                                            positionAggregation,
+                                            positionUpdates,
+                                            whiteWin,
+                                            draw,
+                                            blackWin);
+                                } finally {
+                                    positionNanos += System.nanoTime() - aggregationStarted;
+                                }
+
+                                importedGames++;
+                                totalPlies += moves.size();
                             }
                         } catch (NoMoveFoundException | IllegalArgumentException e) {
                             skippedGames++;
                         }
 
-                        if (processedGames % COMMIT_GAME_BATCH == 0) {
-                            if (pendingPositions > 0) {
-                                upsertPosition.executeBatch();
-                                pendingPositions = 0;
+                        if (positionAggregation.size() >= POSITION_AGGREGATION_LIMIT
+                                || processedGames % COMMIT_GAME_BATCH == 0) {
+                            long databaseStarted = System.nanoTime();
+                            try {
+                                flushPositionAggregation(upsertPosition, importId, positionAggregation);
+                                if (processedGames % COMMIT_GAME_BATCH == 0) {
+                                    connection.commit();
+                                }
+                            } finally {
+                                databaseNanos += System.nanoTime() - databaseStarted;
                             }
-                            connection.commit();
                         }
 
                         publishProgress(
@@ -296,12 +331,21 @@ public class SqliteChessDatabase implements ChessDatabase {
                     }
 
                     checkCancellation(safeCancellationRequested);
-                    if (pendingPositions > 0) {
-                        upsertPosition.executeBatch();
+
+                    long finalWriteStarted = System.nanoTime();
+                    try {
+                        flushPositionAggregation(upsertPosition, importId, positionAggregation);
+                    } finally {
+                        databaseNanos += System.nanoTime() - finalWriteStarted;
                     }
 
-                    finalizeImport(connection, importId);
-                    connection.commit();
+                    long finalizeStarted = System.nanoTime();
+                    try {
+                        finalizeImport(connection, importId);
+                        connection.commit();
+                    } finally {
+                        finalizeNanos += System.nanoTime() - finalizeStarted;
+                    }
                 } catch (SQLException | IOException | RuntimeException e) {
                     connection.rollback();
                     throw e;
@@ -316,6 +360,16 @@ public class SqliteChessDatabase implements ChessDatabase {
         }
 
         long elapsed = Duration.between(startedAt, Instant.now()).toMillis();
+        long totalNanos = System.nanoTime() - importStartedNanos;
+        logImportProfile(
+                totalNanos,
+                parsingNanos,
+                positionNanos,
+                databaseNanos,
+                finalizeNanos,
+                importedGames,
+                skippedGames,
+                totalPlies);
         publishProgress(
                 safeProgressConsumer,
                 countingInputStream,
@@ -326,6 +380,109 @@ public class SqliteChessDatabase implements ChessDatabase {
                 totalPlies,
                 startedAt);
         return new ImportResult(importedGames, skippedGames, totalPlies, elapsed);
+    }
+
+    /**
+     * Adds one game's position continuations to the bounded in-memory aggregate.
+     *
+     * @param aggregation current aggregate
+     * @param updates position/move keys from one validated game
+     * @param whiteWin white-win increment
+     * @param draw draw increment
+     * @param blackWin black-win increment
+     */
+    private void aggregatePositionUpdates(
+            Map<PositionMoveKey, PositionAggregate> aggregation,
+            List<PositionMoveKey> updates,
+            int whiteWin,
+            int draw,
+            int blackWin) {
+        for (PositionMoveKey update : updates) {
+            PositionAggregate aggregate = aggregation.get(update);
+            if (aggregate == null) {
+                aggregate = new PositionAggregate();
+                aggregation.put(update, aggregate);
+            }
+            aggregate.add(whiteWin, draw, blackWin);
+        }
+    }
+
+    /**
+     * Flushes the bounded position aggregate to SQLite in batches and clears it.
+     *
+     * @param statement staging upsert statement
+     * @param importId import identifier
+     * @param aggregation current aggregate
+     */
+    private void flushPositionAggregation(
+            PreparedStatement statement,
+            String importId,
+            Map<PositionMoveKey, PositionAggregate> aggregation) throws SQLException {
+        if (aggregation.isEmpty()) {
+            return;
+        }
+
+        int pending = 0;
+        for (Map.Entry<PositionMoveKey, PositionAggregate> entry : aggregation.entrySet()) {
+            PositionMoveKey key = entry.getKey();
+            PositionAggregate aggregate = entry.getValue();
+
+            statement.setString(1, importId);
+            statement.setLong(2, key.hashHigh());
+            statement.setLong(3, key.hashLow());
+            statement.setInt(4, key.moveCode());
+            statement.setLong(5, aggregate.games);
+            statement.setLong(6, aggregate.whiteWins);
+            statement.setLong(7, aggregate.draws);
+            statement.setLong(8, aggregate.blackWins);
+            statement.addBatch();
+            pending++;
+
+            if (pending >= POSITION_BATCH_SIZE) {
+                statement.executeBatch();
+                pending = 0;
+            }
+        }
+
+        if (pending > 0) {
+            statement.executeBatch();
+        }
+        aggregation.clear();
+    }
+
+    /**
+     * Prints one compact timing breakdown for performance comparisons.
+     */
+    private void logImportProfile(
+            long totalNanos,
+            long parsingNanos,
+            long positionNanos,
+            long databaseNanos,
+            long finalizeNanos,
+            long importedGames,
+            long skippedGames,
+            long totalPlies) {
+        long measuredNanos = parsingNanos + positionNanos + databaseNanos + finalizeNanos;
+        long otherNanos = Math.max(0L, totalNanos - measuredNanos);
+        System.out.printf(
+                Locale.ROOT,
+                "Chess database import profile: total=%.3f s; PGN/SAN=%.3f s; position/index=%.3f s; SQLite=%.3f s; finalize=%.3f s; other=%.3f s; imported=%d; skipped=%d; plies=%d%n",
+                seconds(totalNanos),
+                seconds(parsingNanos),
+                seconds(positionNanos),
+                seconds(databaseNanos),
+                seconds(finalizeNanos),
+                seconds(otherNanos),
+                importedGames,
+                skippedGames,
+                totalPlies);
+    }
+
+    /**
+     * Converts nanoseconds to fractional seconds.
+     */
+    private double seconds(long nanos) {
+        return nanos / 1_000_000_000.0d;
     }
 
     /**
@@ -433,7 +590,7 @@ public class SqliteChessDatabase implements ChessDatabase {
     /**
      * Recreates a PGN document for a stored game.
      *
-     * @param id game identifier
+     * @param id database game identifier
      * @return PGN text
      */
     @Override
@@ -1137,12 +1294,34 @@ public class SqliteChessDatabase implements ChessDatabase {
     }
 
     /**
-     * Prevalidated aggregate update generated from one imported move.
+     * Compact key for one position and its next move.
      *
-     * @param hash position before the move
-     * @param moveCode compact encoded move
+     * @param hashHigh high 64 bits of the position hash
+     * @param hashLow low 64 bits of the position hash
+     * @param moveCode compact move code
      */
-    private record PositionUpdate(PositionHash hash, int moveCode) {
+    private record PositionMoveKey(long hashHigh, long hashLow, int moveCode) {
+    }
+
+    /**
+     * Mutable in-memory aggregate for one position/move key.
+     */
+    private static final class PositionAggregate {
+
+        private long games;
+        private long whiteWins;
+        private long draws;
+        private long blackWins;
+
+        /**
+         * Adds one game's result to the aggregate.
+         */
+        private void add(int whiteWin, int draw, int blackWin) {
+            games++;
+            whiteWins += whiteWin;
+            draws += draw;
+            blackWins += blackWin;
+        }
     }
 
     /**
