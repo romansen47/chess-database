@@ -41,7 +41,7 @@ public class SqliteChessDatabase implements ChessDatabase {
     public static final int HASH_VERSION = 1;
     public static final int MOVE_CODEC_VERSION = 1;
 
-    private static final int COMMIT_GAME_BATCH = 1_000;
+    private static final int COMMIT_GAME_BATCH = 10_000;
     private static final int POSITION_BATCH_SIZE = 5_000;
     private static final int POSITION_AGGREGATION_LIMIT = 100_000;
     private static final int PLAYER_CACHE_SIZE = 10_000;
@@ -177,6 +177,19 @@ public class SqliteChessDatabase implements ChessDatabase {
                             "INSERT OR IGNORE INTO player(name, normalized_name) VALUES (?, ?)");
                     PreparedStatement selectPlayer = connection.prepareStatement(
                             "SELECT id FROM player WHERE normalized_name = ?");
+                    PreparedStatement findDuplicateGame = connection.prepareStatement(
+                            """
+                            SELECT 1
+                            FROM game
+                            WHERE white_player_id IS ?
+                              AND black_player_id IS ?
+                              AND game_date IS ?
+                              AND round IS ?
+                              AND result = ?
+                              AND ply_count = ?
+                              AND moves = ?
+                            LIMIT 1
+                            """);
                     PreparedStatement insertGame = connection.prepareStatement(
                             """
                             INSERT INTO game(
@@ -247,6 +260,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                                 }
 
                                 String result = normalizeResult(tags.get("Result"));
+                                boolean duplicate = false;
                                 long databaseStarted = System.nanoTime();
                                 try {
                                     Long whitePlayerId = findOrCreatePlayer(
@@ -259,48 +273,63 @@ public class SqliteChessDatabase implements ChessDatabase {
                                             selectPlayer,
                                             playerCache,
                                             tags.get("Black"));
-
-                                    bindNullableLong(insertGame, 1, whitePlayerId);
-                                    bindNullableLong(insertGame, 2, blackPlayerId);
-                                    bindNullableInteger(insertGame, 3, parseInteger(tags.get("WhiteElo")));
-                                    bindNullableInteger(insertGame, 4, parseInteger(tags.get("BlackElo")));
-                                    insertGame.setString(5, normalizeTag(tags.get("Event")));
-                                    insertGame.setString(6, normalizeTag(tags.get("Site")));
-
                                     String date = normalizeTag(tags.get("Date"));
-                                    insertGame.setString(7, date);
-                                    bindNullableInteger(insertGame, 8, parseYear(date));
+                                    String round = normalizeTag(tags.get("Round"));
 
-                                    insertGame.setString(9, normalizeTag(tags.get("Round")));
-                                    insertGame.setString(10, result);
-                                    insertGame.setString(11, normalizeTag(tags.get("ECO")));
-                                    insertGame.setInt(12, moves.size());
-                                    insertGame.setBytes(13, encodedMoves);
-                                    insertGame.setString(14, encodeTags(tags));
-                                    insertGame.setString(15, importId);
-                                    insertGame.executeUpdate();
+                                    duplicate = isDuplicateGame(
+                                            findDuplicateGame,
+                                            whitePlayerId,
+                                            blackPlayerId,
+                                            date,
+                                            round,
+                                            result,
+                                            moves.size(),
+                                            encodedMoves);
+
+                                    if (duplicate) {
+                                        skippedGames++;
+                                    } else {
+                                        bindNullableLong(insertGame, 1, whitePlayerId);
+                                        bindNullableLong(insertGame, 2, blackPlayerId);
+                                        bindNullableInteger(insertGame, 3, parseInteger(tags.get("WhiteElo")));
+                                        bindNullableInteger(insertGame, 4, parseInteger(tags.get("BlackElo")));
+                                        insertGame.setString(5, normalizeTag(tags.get("Event")));
+                                        insertGame.setString(6, normalizeTag(tags.get("Site")));
+                                        insertGame.setString(7, date);
+                                        bindNullableInteger(insertGame, 8, parseYear(date));
+                                        insertGame.setString(9, round);
+                                        insertGame.setString(10, result);
+                                        insertGame.setString(11, normalizeTag(tags.get("ECO")));
+                                        insertGame.setInt(12, moves.size());
+                                        insertGame.setBytes(13, encodedMoves);
+                                        insertGame.setString(14, encodeTags(tags));
+                                        insertGame.setString(15, importId);
+                                        insertGame.executeUpdate();
+                                    }
                                 } finally {
                                     databaseNanos += System.nanoTime() - databaseStarted;
                                 }
 
-                                int whiteWin = "1-0".equals(result) ? 1 : 0;
-                                int draw = "1/2-1/2".equals(result) ? 1 : 0;
-                                int blackWin = "0-1".equals(result) ? 1 : 0;
+                                if (!duplicate) {
+                                    int whiteWin = "1-0".equals(result) ? 1 : 0;
+                                    int draw = "1/2-1/2".equals(result) ? 1 : 0;
+                                    int blackWin = "0-1".equals(result) ? 1 : 0;
 
-                                long aggregationStarted = System.nanoTime();
-                                try {
-                                    aggregatePositionUpdates(
-                                            positionAggregation,
-                                            positionUpdates,
-                                            whiteWin,
-                                            draw,
-                                            blackWin);
-                                } finally {
-                                    positionNanos += System.nanoTime() - aggregationStarted;
+                                    long aggregationStarted = System.nanoTime();
+                                    try {
+                                        aggregatePositionUpdates(
+                                                positionAggregation,
+                                                positionUpdates,
+                                                whiteWin,
+                                                draw,
+                                                blackWin);
+                                    } finally {
+                                        positionNanos += System.nanoTime() - aggregationStarted;
+                                    }
+
+                                    importedGames++;
+                                    totalPlies += moves.size();
                                 }
-
-                                importedGames++;
-                                totalPlies += moves.size();
                             }
                         } catch (NoMoveFoundException | IllegalArgumentException e) {
                             skippedGames++;
@@ -753,6 +782,11 @@ public class SqliteChessDatabase implements ChessDatabase {
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_result ON game(result)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_eco ON game(eco)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_import_id ON game(import_id)");
+            statement.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_game_duplicate_lookup
+                    ON game(white_player_id, black_player_id, game_date, round, result, ply_count)
+                    """);
             statement.execute("CREATE INDEX IF NOT EXISTS idx_position_stage_import_id ON position_move_stage(import_id)");
 
             writeInfoIfAbsent(connection, "hash_version", Integer.toString(HASH_VERSION));
@@ -1000,6 +1034,35 @@ public class SqliteChessDatabase implements ChessDatabase {
             long id = resultSet.getLong(1);
             playerCache.put(normalized, id);
             return id;
+        }
+    }
+
+    /**
+     * Returns whether the game already exists in the database.
+     *
+     * <p>The identity is intentionally conservative: same players, date, round,
+     * result, ply count and exact compact move sequence. This catches repeated
+     * imports of the same game while avoiding false positives for distinct games
+     * that happen to share an opening sequence.</p>
+     */
+    private boolean isDuplicateGame(
+            PreparedStatement statement,
+            Long whitePlayerId,
+            Long blackPlayerId,
+            String date,
+            String round,
+            String result,
+            int plyCount,
+            byte[] encodedMoves) throws SQLException {
+        bindNullableLong(statement, 1, whitePlayerId);
+        bindNullableLong(statement, 2, blackPlayerId);
+        statement.setString(3, date);
+        statement.setString(4, round);
+        statement.setString(5, result);
+        statement.setInt(6, plyCount);
+        statement.setBytes(7, encodedMoves);
+        try (ResultSet resultSet = statement.executeQuery()) {
+            return resultSet.next();
         }
     }
 
