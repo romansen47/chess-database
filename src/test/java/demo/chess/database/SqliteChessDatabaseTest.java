@@ -96,6 +96,43 @@ class SqliteChessDatabaseTest {
     }
 
     /**
+     * Verifies that importing the same game again neither stores another game nor
+     * increments the position statistics a second time.
+     */
+    @Test
+    void skipsDuplicateGames() throws Exception {
+        String pgn = """
+                [Event "Duplicate Test"]
+                [Site "Stuttgart"]
+                [Date "2026.09.06"]
+                [Round "7"]
+                [White "Alpha, Alice"]
+                [Black "Beta, Bob"]
+                [WhiteElo "2500"]
+                [BlackElo "2450"]
+                [Result "1-0"]
+
+                1. e4 e5 2. Nf3 Nc6 1-0
+                """;
+        byte[] bytes = pgn.getBytes(StandardCharsets.UTF_8);
+        SqliteChessDatabase database = new SqliteChessDatabase(tempDirectory.resolve("duplicate.db"));
+
+        ImportResult first = database.importPgn(new ByteArrayInputStream(bytes));
+        ImportResult second = database.importPgn(new ByteArrayInputStream(bytes));
+
+        assertEquals(1, first.importedGames());
+        assertEquals(0, first.skippedGames());
+        assertEquals(0, second.importedGames());
+        assertEquals(1, second.skippedGames());
+        assertEquals(1, database.getStatus().gameCount());
+
+        PositionStatistics initialPosition = database.findPosition(List.of(), 0);
+        assertEquals(1, initialPosition.moves().size());
+        assertEquals("e2e4", initialPosition.moves().get(0).move());
+        assertEquals(1, initialPosition.moves().get(0).games());
+    }
+
+    /**
      * Verifies cancellation removes the entire staged import and emits useful progress.
      */
     @Test
