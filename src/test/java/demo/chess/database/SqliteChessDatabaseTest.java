@@ -197,4 +197,32 @@ class SqliteChessDatabaseTest {
                 1. d4 d5 2. Nf3 Nf6 1/2-1/2
                 """;
     }
+
+    @Test
+    void migratesExistingDatabaseAndStoresAnnotatedPgnWithoutReimport() throws Exception {
+        String pgn = """
+                [Event "Annotated"]
+                [Site "?"]
+                [Date "2026.09.12"]
+                [Round "1"]
+                [White "Alpha"]
+                [Black "Beta"]
+                [Result "1-0"]
+
+                1. e4 e5 2. Nf3 Nc6 1-0
+                """;
+
+        Path path = tempDirectory.resolve("annotations.db");
+        SqliteChessDatabase database = new SqliteChessDatabase(path);
+        database.importPgn(new ByteArrayInputStream(pgn.getBytes(StandardCharsets.UTF_8)));
+
+        long gameId = database.findGameId(pgn);
+        String annotated = pgn.replace("1. e4", "1. e4 $1 {[%eval 0.31] Central control.}");
+        database.saveAnnotatedPgn(gameId, annotated);
+
+        assertEquals(SqliteChessDatabase.SCHEMA_VERSION, database.getStatus().schemaVersion());
+        assertEquals(annotated, database.getGameAsPgn(gameId));
+        assertEquals(1, database.getStatus().gameCount());
+    }
+
 }

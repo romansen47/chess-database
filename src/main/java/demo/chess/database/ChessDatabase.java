@@ -84,6 +84,22 @@ public interface ChessDatabase {
     String getGameAsPgn(long id) throws SQLException, IOException, NoMoveFoundException;
 
     /**
+     * Finds the database identifier for the supplied main-line PGN identity.
+     *
+     * @param pgn complete PGN document
+     * @return database game identifier
+     */
+    long findGameId(String pgn) throws SQLException, IOException, NoMoveFoundException;
+
+    /**
+     * Stores the annotated PGN representation for one game.
+     *
+     * @param id database game identifier
+     * @param pgn complete annotated PGN document
+     */
+    void saveAnnotatedPgn(long id, String pgn) throws SQLException;
+
+    /**
      * Returns move statistics for the position reached after the requested ply.
      *
      * @param uciMoves game moves from the initial position

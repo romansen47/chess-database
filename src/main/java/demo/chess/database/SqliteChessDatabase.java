@@ -37,7 +37,7 @@ import demo.chess.save.GameSaver;
  */
 public class SqliteChessDatabase implements ChessDatabase {
 
-    public static final int SCHEMA_VERSION = 2;
+    public static final int SCHEMA_VERSION = 3;
     public static final int HASH_VERSION = 1;
     public static final int MOVE_CODEC_VERSION = 1;
 
@@ -624,10 +624,105 @@ public class SqliteChessDatabase implements ChessDatabase {
      */
     @Override
     public String getGameAsPgn(long id) throws SQLException, IOException, NoMoveFoundException {
+        try (Connection connection = openConnection();
+                PreparedStatement statement = connection.prepareStatement(
+                        "SELECT annotated_pgn FROM game_annotation WHERE game_id = ?")) {
+            statement.setLong(1, id);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    return resultSet.getString(1);
+                }
+            }
+        }
+
         StoredGame storedGame = getGame(id);
         Simulation simulation = Simulation.createSimulation();
         gameLoader.loadGame(storedGame.uciMoves(), simulation);
         return gameSaver.toPgn(simulation.getMoveList(), storedGame.tags());
+    }
+
+    @Override
+    public long findGameId(String pgn) throws SQLException, IOException, NoMoveFoundException {
+        Map<String, String> tags = gameLoader.parsePgnTags(pgn);
+        List<String> moves = gameLoader.parsePgnMoveList(pgn);
+        byte[] encodedMoves = MoveCodec.encodeMoves(moves);
+
+        String white = normalizeLookupPlayer(tags.get("White"));
+        String black = normalizeLookupPlayer(tags.get("Black"));
+        String date = normalizeTag(tags.get("Date"));
+        String round = normalizeTag(tags.get("Round"));
+        String result = normalizeResult(tags.get("Result"));
+
+        try (Connection connection = openConnection();
+                PreparedStatement statement = connection.prepareStatement(
+                        """
+                        SELECT g.id
+                        FROM game g
+                        LEFT JOIN player w ON w.id = g.white_player_id
+                        LEFT JOIN player b ON b.id = g.black_player_id
+                        WHERE g.import_id IS NULL
+                          AND COALESCE(w.normalized_name, '') = ?
+                          AND COALESCE(b.normalized_name, '') = ?
+                          AND g.game_date IS ?
+                          AND g.round IS ?
+                          AND g.result = ?
+                          AND g.ply_count = ?
+                          AND g.moves = ?
+                        ORDER BY g.id DESC
+                        LIMIT 1
+                        """)) {
+            statement.setString(1, white);
+            statement.setString(2, black);
+            statement.setString(3, date);
+            statement.setString(4, round);
+            statement.setString(5, result);
+            statement.setInt(6, moves.size());
+            statement.setBytes(7, encodedMoves);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    throw new NoSuchElementException("Imported chess database game could not be resolved.");
+                }
+                return resultSet.getLong(1);
+            }
+        }
+    }
+
+    @Override
+    public void saveAnnotatedPgn(long id, String pgn) throws SQLException {
+        if (pgn == null || pgn.isBlank()) {
+            throw new IllegalArgumentException("Annotated PGN must not be blank.");
+        }
+
+        try (Connection connection = openConnection();
+                PreparedStatement gameExists = connection.prepareStatement(
+                        "SELECT 1 FROM game WHERE id = ? AND import_id IS NULL");
+                PreparedStatement upsert = connection.prepareStatement(
+                        """
+                        INSERT INTO game_annotation(game_id, annotated_pgn, updated_at)
+                        VALUES (?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(game_id) DO UPDATE SET
+                            annotated_pgn = excluded.annotated_pgn,
+                            updated_at = CURRENT_TIMESTAMP
+                        """)) {
+            gameExists.setLong(1, id);
+            try (ResultSet resultSet = gameExists.executeQuery()) {
+                if (!resultSet.next()) {
+                    throw new NoSuchElementException("Chess database game not found: " + id);
+                }
+            }
+
+            upsert.setLong(1, id);
+            upsert.setString(2, pgn);
+            upsert.executeUpdate();
+        }
+    }
+
+    private String normalizeLookupPlayer(String value) {
+        String normalized = normalizeTag(value);
+        if (normalized == null || "?".equals(normalized)) {
+            return "";
+        }
+        return normalizePlayerName(normalized);
     }
 
     /**
@@ -747,6 +842,16 @@ public class SqliteChessDatabase implements ChessDatabase {
                     )
                     """);
             ensureColumn(connection, "game", "import_id", "TEXT");
+
+            statement.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS game_annotation(
+                        game_id INTEGER PRIMARY KEY,
+                        annotated_pgn TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY(game_id) REFERENCES game(id) ON DELETE CASCADE
+                    )
+                    """);
 
             statement.execute(
                     """
