@@ -3,12 +3,16 @@ package demo.chess.database;
 import java.util.List;
 import java.util.Locale;
 
+import demo.chess.definitions.ChessStartingPosition;
+import demo.chess.definitions.PieceType;
+
 /**
- * Stable incremental 128-bit Zobrist hashing for standard chess positions.
+ * Stable incremental 128-bit Zobrist hashing for classical chess and Chess960.
  *
- * <p>The hash contains piece placement, side to move, castling rights and the
- * en-passant target square. Half-move and full-move counters are deliberately
- * excluded.</p>
+ * <p>Classical position 518 deliberately keeps the historic feature layout, so
+ * existing standard-chess position hashes remain byte-for-byte compatible.
+ * Chess960 adds deterministic features for the Scharnagl start id and original
+ * castling-rook files.</p>
  */
 public final class ZobristPositionHasher {
 
@@ -21,30 +25,41 @@ public final class ZobristPositionHasher {
     private static final int CASTLING_FEATURE = SIDE_FEATURE + 1;
     private static final int EN_PASSANT_FEATURE = CASTLING_FEATURE + 4;
 
-    /**
-     * Prevents instantiation.
-     */
+    // Extension features live strictly after the legacy feature range.
+    private static final int CHESS960_CASTLING_FILE_FEATURE = EN_PASSANT_FEATURE + 64;
+    private static final int CHESS960_START_FEATURE = CHESS960_CASTLING_FILE_FEATURE + 4 * 8;
+
     private ZobristPositionHasher() {
     }
 
-    /**
-     * Creates a cursor at the standard initial position.
-     *
-     * @return new position cursor
-     */
+    /** Creates a cursor at classical Scharnagl position 518. */
     public static Cursor newCursor() {
-        return new Cursor();
+        return new Cursor(ChessStartingPosition.STANDARD);
     }
 
-    /**
-     * Computes the hash after applying a prefix of a UCI move list.
-     *
-     * @param moves UCI moves
-     * @param ply number of moves to apply
-     * @return resulting position hash
-     */
+    /** Creates a cursor at one Scharnagl position. */
+    public static Cursor newCursor(int startingPositionId) {
+        return new Cursor(ChessStartingPosition.of(startingPositionId));
+    }
+
+    /** Creates a cursor at one Scharnagl position. */
+    public static Cursor newCursor(ChessStartingPosition startingPosition) {
+        return new Cursor(startingPosition == null
+                ? ChessStartingPosition.STANDARD
+                : startingPosition);
+    }
+
+    /** Computes a classical position hash after a move prefix. */
     public static PositionHash hashAfterMoves(List<String> moves, int ply) {
-        Cursor cursor = newCursor();
+        return hashAfterMoves(ChessStartingPosition.STANDARD_ID, moves, ply);
+    }
+
+    /** Computes a position hash after a move prefix from one Chess960 start id. */
+    public static PositionHash hashAfterMoves(
+            int startingPositionId,
+            List<String> moves,
+            int ply) {
+        Cursor cursor = newCursor(startingPositionId);
         int safePly = Math.max(0, Math.min(ply, moves == null ? 0 : moves.size()));
         for (int index = 0; index < safePly; index++) {
             cursor.apply(moves.get(index));
@@ -52,44 +67,36 @@ public final class ZobristPositionHasher {
         return cursor.hash();
     }
 
-    /**
-     * Mutable incremental position cursor used during imports and queries.
-     */
+    /** Mutable incremental position cursor used during imports and queries. */
     public static final class Cursor {
 
         private final char[] board = new char[64];
+        private final ChessStartingPosition startingPosition;
 
         private boolean whiteToMove = true;
-        private boolean whiteKingSide = true;
-        private boolean whiteQueenSide = true;
-        private boolean blackKingSide = true;
-        private boolean blackQueenSide = true;
+        private Integer whiteKingSideRookSquare;
+        private Integer whiteQueenSideRookSquare;
+        private Integer blackKingSideRookSquare;
+        private Integer blackQueenSideRookSquare;
         private int enPassantSquare = -1;
 
         private long high;
         private long low;
 
-        /**
-         * Creates a cursor for the standard initial position.
-         */
-        private Cursor() {
+        private Cursor(ChessStartingPosition startingPosition) {
+            this.startingPosition = startingPosition;
             initializeBoard();
+            initializeCastlingRights();
             initializeHash();
         }
 
-        /**
-         * Returns the current 128-bit position hash.
-         *
-         * @return position hash
-         */
         public PositionHash hash() {
             return new PositionHash(high, low);
         }
 
         /**
-         * Applies one legal standard-chess UCI move and updates the hash incrementally.
-         *
-         * @param rawMove UCI move
+         * Applies one UCI move. Chess960 castling follows the UCI convention
+         * king-source -> original-rook-source.
          */
         public void apply(String rawMove) {
             String move = normalizeMove(rawMove);
@@ -106,6 +113,14 @@ public final class ZobristPositionHasher {
 
             char capturedPiece = board[to];
             removeEnPassantKey();
+
+            if (Character.toLowerCase(movingPiece) == 'k'
+                    && isCastlingMove(from, to, movingPiece, capturedPiece)) {
+                applyCastling(from, to, movingPiece);
+                enPassantSquare = -1;
+                toggleSideToMove();
+                return;
+            }
 
             updateCastlingRightsForMove(movingPiece, from);
             updateCastlingRightsForCapture(capturedPiece, to);
@@ -131,11 +146,6 @@ public final class ZobristPositionHasher {
                 xorPiece(capturedPiece, to);
             }
 
-            if (Character.toLowerCase(movingPiece) == 'k'
-                    && Math.abs((from % 8) - (to % 8)) == 2) {
-                moveCastlingRook(from, to);
-            }
-
             char placedPiece = movingPiece;
             if (move.length() == 5) {
                 placedPiece = promotedPiece(move.charAt(4), Character.isUpperCase(movingPiece));
@@ -151,202 +161,224 @@ public final class ZobristPositionHasher {
                 enPassantSquare = -1;
             }
 
-            whiteToMove = !whiteToMove;
-            xorFeature(SIDE_FEATURE);
+            toggleSideToMove();
         }
 
-        /**
-         * Initializes the standard piece placement.
-         */
         private void initializeBoard() {
-            String whiteBackRank = "RNBQKBNR";
-            String blackBackRank = "rnbqkbnr";
+            PieceType[] backRank = startingPosition.getBackRank();
             for (int file = 0; file < 8; file++) {
-                board[file] = whiteBackRank.charAt(file);
+                char whitePiece = pieceSymbol(backRank[file], true);
+                board[file] = whitePiece;
                 board[8 + file] = 'P';
                 board[48 + file] = 'p';
-                board[56 + file] = blackBackRank.charAt(file);
+                board[56 + file] = Character.toLowerCase(whitePiece);
             }
         }
 
-        /**
-         * Computes the initial hash once from the initial position.
-         */
+        private void initializeCastlingRights() {
+            int whiteRankOffset = 0;
+            int blackRankOffset = 56;
+            whiteKingSideRookSquare = whiteRankOffset + startingPosition.getKingSideRookFile() - 1;
+            whiteQueenSideRookSquare = whiteRankOffset + startingPosition.getQueenSideRookFile() - 1;
+            blackKingSideRookSquare = blackRankOffset + startingPosition.getKingSideRookFile() - 1;
+            blackQueenSideRookSquare = blackRankOffset + startingPosition.getQueenSideRookFile() - 1;
+        }
+
         private void initializeHash() {
             for (int square = 0; square < board.length; square++) {
                 if (board[square] != 0) {
                     xorPiece(board[square], square);
                 }
             }
-            xorFeature(CASTLING_FEATURE);
-            xorFeature(CASTLING_FEATURE + 1);
-            xorFeature(CASTLING_FEATURE + 2);
-            xorFeature(CASTLING_FEATURE + 3);
+            xorCastlingRight(0, whiteKingSideRookSquare);
+            xorCastlingRight(1, whiteQueenSideRookSquare);
+            xorCastlingRight(2, blackKingSideRookSquare);
+            xorCastlingRight(3, blackQueenSideRookSquare);
+            if (!startingPosition.isStandard()) {
+                xorFeature(CHESS960_START_FEATURE + startingPosition.getId());
+            }
         }
 
-        /**
-         * Removes the current en-passant component from the hash.
-         */
         private void removeEnPassantKey() {
             if (enPassantSquare >= 0) {
                 xorFeature(EN_PASSANT_FEATURE + enPassantSquare);
             }
         }
 
-        /**
-         * Moves the rook belonging to a castling king move.
-         *
-         * @param kingFrom king source square
-         * @param kingTo king target square
-         */
-        private void moveCastlingRook(int kingFrom, int kingTo) {
+        private boolean isCastlingMove(int from, int to, char king, char targetPiece) {
+            if (startingPosition.isStandard()) {
+                return Math.abs((from % 8) - (to % 8)) == 2;
+            }
+            if (Character.toLowerCase(targetPiece) != 'r'
+                    || Character.isUpperCase(targetPiece) != Character.isUpperCase(king)) {
+                return false;
+            }
+            Integer kingSideRook = Character.isUpperCase(king)
+                    ? whiteKingSideRookSquare
+                    : blackKingSideRookSquare;
+            Integer queenSideRook = Character.isUpperCase(king)
+                    ? whiteQueenSideRookSquare
+                    : blackQueenSideRookSquare;
+            return Integer.valueOf(to).equals(kingSideRook)
+                    || Integer.valueOf(to).equals(queenSideRook);
+        }
+
+        private void applyCastling(int kingFrom, int encodedTarget, char king) {
+            boolean white = Character.isUpperCase(king);
+            Integer kingSideRook = white ? whiteKingSideRookSquare : blackKingSideRookSquare;
+            Integer queenSideRook = white ? whiteQueenSideRookSquare : blackQueenSideRookSquare;
+
+            boolean kingSide;
             int rookFrom;
-            int rookTo;
-            if (kingTo > kingFrom) {
-                rookFrom = kingFrom + 3;
-                rookTo = kingFrom + 1;
+            if (!startingPosition.isStandard()) {
+                if (Integer.valueOf(encodedTarget).equals(kingSideRook)) {
+                    kingSide = true;
+                    rookFrom = encodedTarget;
+                } else if (Integer.valueOf(encodedTarget).equals(queenSideRook)) {
+                    kingSide = false;
+                    rookFrom = encodedTarget;
+                } else {
+                    throw new IllegalArgumentException("Castling target is not an active rook square");
+                }
             } else {
-                rookFrom = kingFrom - 4;
-                rookTo = kingFrom - 1;
+                kingSide = encodedTarget > kingFrom;
+                Integer rookSquare = kingSide ? kingSideRook : queenSideRook;
+                if (rookSquare == null) {
+                    throw new IllegalArgumentException("Castling right is unavailable");
+                }
+                rookFrom = rookSquare;
             }
 
             char rook = board[rookFrom];
-            if (Character.toLowerCase(rook) != 'r') {
+            if (Character.toLowerCase(rook) != 'r'
+                    || Character.isUpperCase(rook) != white) {
                 throw new IllegalArgumentException("Castling rook is missing");
             }
 
+            int rankOffset = white ? 0 : 56;
+            int kingTo = rankOffset + (kingSide ? 6 : 2); // g/c
+            int rookTo = rankOffset + (kingSide ? 5 : 3); // f/d
+
+            disableAllCastlingRights(white);
+
+            xorPiece(king, kingFrom);
+            board[kingFrom] = 0;
             xorPiece(rook, rookFrom);
             board[rookFrom] = 0;
+
+            board[kingTo] = king;
+            xorPiece(king, kingTo);
             board[rookTo] = rook;
             xorPiece(rook, rookTo);
         }
 
-        /**
-         * Removes castling rights caused by the moving piece.
-         *
-         * @param movingPiece moving piece
-         * @param from source square
-         */
         private void updateCastlingRightsForMove(char movingPiece, int from) {
             switch (movingPiece) {
-                case 'K' -> {
-                    disableWhiteKingSide();
-                    disableWhiteQueenSide();
-                }
-                case 'k' -> {
-                    disableBlackKingSide();
-                    disableBlackQueenSide();
-                }
-                case 'R' -> {
-                    if (from == 0) {
-                        disableWhiteQueenSide();
-                    } else if (from == 7) {
-                        disableWhiteKingSide();
-                    }
-                }
-                case 'r' -> {
-                    if (from == 56) {
-                        disableBlackQueenSide();
-                    } else if (from == 63) {
-                        disableBlackKingSide();
-                    }
-                }
+                case 'K' -> disableAllCastlingRights(true);
+                case 'k' -> disableAllCastlingRights(false);
+                case 'R' -> disableRookRight(true, from);
+                case 'r' -> disableRookRight(false, from);
                 default -> {
                     // No castling right changes.
                 }
             }
         }
 
-        /**
-         * Removes castling rights caused by capturing a rook on its initial square.
-         *
-         * @param capturedPiece captured piece
-         * @param to capture square
-         */
         private void updateCastlingRightsForCapture(char capturedPiece, int to) {
             if (capturedPiece == 'R') {
-                if (to == 0) {
-                    disableWhiteQueenSide();
-                } else if (to == 7) {
-                    disableWhiteKingSide();
-                }
+                disableRookRight(true, to);
             } else if (capturedPiece == 'r') {
-                if (to == 56) {
-                    disableBlackQueenSide();
-                } else if (to == 63) {
-                    disableBlackKingSide();
+                disableRookRight(false, to);
+            }
+        }
+
+        private void disableAllCastlingRights(boolean white) {
+            if (white) {
+                if (whiteKingSideRookSquare != null) {
+                    xorCastlingRight(0, whiteKingSideRookSquare);
+                    whiteKingSideRookSquare = null;
+                }
+                if (whiteQueenSideRookSquare != null) {
+                    xorCastlingRight(1, whiteQueenSideRookSquare);
+                    whiteQueenSideRookSquare = null;
+                }
+            } else {
+                if (blackKingSideRookSquare != null) {
+                    xorCastlingRight(2, blackKingSideRookSquare);
+                    blackKingSideRookSquare = null;
+                }
+                if (blackQueenSideRookSquare != null) {
+                    xorCastlingRight(3, blackQueenSideRookSquare);
+                    blackQueenSideRookSquare = null;
+                }
+            }
+        }
+
+        private void disableRookRight(boolean white, int square) {
+            if (white) {
+                if (Integer.valueOf(square).equals(whiteKingSideRookSquare)) {
+                    xorCastlingRight(0, whiteKingSideRookSquare);
+                    whiteKingSideRookSquare = null;
+                }
+                if (Integer.valueOf(square).equals(whiteQueenSideRookSquare)) {
+                    xorCastlingRight(1, whiteQueenSideRookSquare);
+                    whiteQueenSideRookSquare = null;
+                }
+            } else {
+                if (Integer.valueOf(square).equals(blackKingSideRookSquare)) {
+                    xorCastlingRight(2, blackKingSideRookSquare);
+                    blackKingSideRookSquare = null;
+                }
+                if (Integer.valueOf(square).equals(blackQueenSideRookSquare)) {
+                    xorCastlingRight(3, blackQueenSideRookSquare);
+                    blackQueenSideRookSquare = null;
                 }
             }
         }
 
         /**
-         * Disables White's king-side castling right.
+         * The first four castling features are the legacy KQkq flags. Chess960
+         * additionally includes the original rook file so rights are unambiguous.
          */
-        private void disableWhiteKingSide() {
-            if (whiteKingSide) {
-                whiteKingSide = false;
-                xorFeature(CASTLING_FEATURE);
+        private void xorCastlingRight(int rightIndex, Integer rookSquare) {
+            if (rookSquare == null) {
+                return;
+            }
+            xorFeature(CASTLING_FEATURE + rightIndex);
+            if (!startingPosition.isStandard()) {
+                int rookFile = rookSquare % 8;
+                xorFeature(CHESS960_CASTLING_FILE_FEATURE + rightIndex * 8 + rookFile);
             }
         }
 
-        /**
-         * Disables White's queen-side castling right.
-         */
-        private void disableWhiteQueenSide() {
-            if (whiteQueenSide) {
-                whiteQueenSide = false;
-                xorFeature(CASTLING_FEATURE + 1);
-            }
+        private void toggleSideToMove() {
+            whiteToMove = !whiteToMove;
+            xorFeature(SIDE_FEATURE);
         }
 
-        /**
-         * Disables Black's king-side castling right.
-         */
-        private void disableBlackKingSide() {
-            if (blackKingSide) {
-                blackKingSide = false;
-                xorFeature(CASTLING_FEATURE + 2);
-            }
-        }
-
-        /**
-         * Disables Black's queen-side castling right.
-         */
-        private void disableBlackQueenSide() {
-            if (blackQueenSide) {
-                blackQueenSide = false;
-                xorFeature(CASTLING_FEATURE + 3);
-            }
-        }
-
-        /**
-         * Applies a piece-square key to both 64-bit halves.
-         *
-         * @param piece piece symbol
-         * @param square square index
-         */
         private void xorPiece(char piece, int square) {
             int feature = pieceIndex(piece) * 64 + square;
             xorFeature(feature);
         }
 
-        /**
-         * Applies one stable feature key to both hash halves.
-         *
-         * @param feature feature index
-         */
         private void xorFeature(int feature) {
             high ^= featureKey(HIGH_SEED, feature);
             low ^= featureKey(LOW_SEED, feature);
         }
     }
 
-    /**
-     * Returns the piece index used by the Zobrist table.
-     *
-     * @param piece piece symbol
-     * @return piece index
-     */
+    private static char pieceSymbol(PieceType type, boolean white) {
+        char value = switch (type) {
+            case PAWN -> 'p';
+            case KNIGHT -> 'n';
+            case BISHOP -> 'b';
+            case ROOK -> 'r';
+            case QUEEN -> 'q';
+            case KING -> 'k';
+        };
+        return white ? Character.toUpperCase(value) : value;
+    }
+
     private static int pieceIndex(char piece) {
         return switch (piece) {
             case 'P' -> 0;
@@ -365,13 +397,6 @@ public final class ZobristPositionHasher {
         };
     }
 
-    /**
-     * Returns a promoted piece symbol.
-     *
-     * @param promotion promotion character
-     * @param white whether the moving pawn is white
-     * @return promoted piece symbol
-     */
     private static char promotedPiece(char promotion, boolean white) {
         char piece = switch (Character.toLowerCase(promotion)) {
             case 'q', 'r', 'b', 'n' -> Character.toLowerCase(promotion);
@@ -380,12 +405,6 @@ public final class ZobristPositionHasher {
         return white ? Character.toUpperCase(piece) : piece;
     }
 
-    /**
-     * Validates and normalizes a UCI move.
-     *
-     * @param value source move
-     * @return normalized UCI move
-     */
     private static String normalizeMove(String value) {
         if (value == null) {
             throw new IllegalArgumentException("UCI move must not be null");
@@ -397,23 +416,10 @@ public final class ZobristPositionHasher {
         return result;
     }
 
-    /**
-     * Returns one deterministic 64-bit key for a feature.
-     *
-     * @param seed fixed hash-half seed
-     * @param feature feature index
-     * @return deterministic key
-     */
     private static long featureKey(long seed, int feature) {
         return mix64(seed + STEP * (feature + 1L));
     }
 
-    /**
-     * SplitMix64 finalizer used to derive stable pseudo-random constants.
-     *
-     * @param value input value
-     * @return mixed value
-     */
     private static long mix64(long value) {
         long result = value;
         result = (result ^ (result >>> 30)) * 0xBF58476D1CE4E5B9L;

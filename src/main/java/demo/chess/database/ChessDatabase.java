@@ -8,26 +8,14 @@ import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
+import demo.chess.definitions.ChessStartingPosition;
 import demo.chess.definitions.engines.impl.NoMoveFoundException;
 
-/**
- * Public API of the local chess database.
- */
+/** Public API of the local chess database. */
 public interface ChessDatabase {
 
-    /**
-     * Returns database status information.
-     *
-     * @return current database status
-     */
     ChessDatabaseStatus getStatus() throws SQLException, IOException;
 
-    /**
-     * Imports one or more PGN games from the supplied stream without progress reporting.
-     *
-     * @param inputStream PGN stream
-     * @return completed import summary
-     */
     default ImportResult importPgn(InputStream inputStream) throws SQLException, IOException {
         return importPgn(
                 UUID.randomUUID().toString(),
@@ -38,20 +26,6 @@ public interface ChessDatabase {
                 () -> false);
     }
 
-    /**
-     * Imports one or more PGN games as an isolated import unit.
-     *
-     * <p>Games and position statistics remain invisible to normal database queries until the
-     * import has completed successfully. Cancellation or failure removes all staged data that
-     * belongs to the supplied import identifier.</p>
-     *
-     * @param importId stable identifier of the import job
-     * @param inputStream PGN stream
-     * @param totalBytes total source size, or a negative value when unknown
-     * @param progressConsumer receives running progress snapshots
-     * @param cancellationRequested returns true when the import should be cancelled
-     * @return completed import summary
-     */
     ImportResult importPgn(
             String importId,
             InputStream inputStream,
@@ -59,52 +33,22 @@ public interface ChessDatabase {
             Consumer<ImportProgress> progressConsumer,
             BooleanSupplier cancellationRequested) throws SQLException, IOException;
 
-    /**
-     * Searches stored games.
-     *
-     * @param search search criteria
-     * @return matching games
-     */
     List<GameSummary> findGames(GameSearch search) throws SQLException;
 
-    /**
-     * Loads one complete stored game.
-     *
-     * @param id database game identifier
-     * @return stored game
-     */
     StoredGame getGame(long id) throws SQLException;
 
-    /**
-     * Recreates a PGN document for a stored game.
-     *
-     * @param id database game identifier
-     * @return PGN text
-     */
     String getGameAsPgn(long id) throws SQLException, IOException, NoMoveFoundException;
 
-    /**
-     * Finds the database identifier for the supplied main-line PGN identity.
-     *
-     * @param pgn complete PGN document
-     * @return database game identifier
-     */
     long findGameId(String pgn) throws SQLException, IOException, NoMoveFoundException;
 
-    /**
-     * Stores the annotated PGN representation for one game.
-     *
-     * @param id database game identifier
-     * @param pgn complete annotated PGN document
-     */
     void saveAnnotatedPgn(long id, String pgn) throws SQLException;
 
-    /**
-     * Returns move statistics for the position reached after the requested ply.
-     *
-     * @param uciMoves game moves from the initial position
-     * @param ply number of moves to apply before querying
-     * @return aggregated position statistics
-     */
-    PositionStatistics findPosition(List<String> uciMoves, int ply) throws SQLException;
+    /** Backward-compatible classical lookup. */
+    default PositionStatistics findPosition(List<String> uciMoves, int ply) throws SQLException {
+        return findPosition(ChessStartingPosition.STANDARD_ID, uciMoves, ply);
+    }
+
+    /** Chess960-aware opening/position lookup. */
+    PositionStatistics findPosition(int startingPositionId, List<String> uciMoves, int ply)
+            throws SQLException;
 }
