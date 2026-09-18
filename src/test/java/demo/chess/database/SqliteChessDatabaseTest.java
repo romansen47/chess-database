@@ -36,8 +36,20 @@ class SqliteChessDatabaseTest {
         assertEquals(2, database.getStatus().gameCount());
 
         List<GameSummary> alphaGames = database.findGames(
-                new GameSearch(null, null, "alpha", null, null, null, null, 50));
+                new GameSearch(null, null, "alpha", null, null, null, null, null, 50));
         assertEquals(2, alphaGames.size());
+
+        List<GameSummary> alphaBetaGames = database.findGames(
+                new GameSearch(null, null, "alpha", "beta", null, null, null, null, 50));
+        assertEquals(1, alphaBetaGames.size());
+        assertEquals("Alpha, Alice", alphaBetaGames.get(0).white());
+        assertEquals("Beta, Bob", alphaBetaGames.get(0).black());
+
+        List<GameSummary> alphaGammaGames = database.findGames(
+                new GameSearch(null, null, "alpha", "gamma", null, null, null, null, 50));
+        assertEquals(1, alphaGammaGames.size());
+        assertEquals("Gamma, Gina", alphaGammaGames.get(0).white());
+        assertEquals("Alpha, Alice", alphaGammaGames.get(0).black());
 
         PositionStatistics initialPosition = database.findPosition(List.of(), 0);
         assertEquals(2, initialPosition.moves().size());
@@ -197,7 +209,7 @@ class SqliteChessDatabaseTest {
         assertTrue(progressSnapshots.stream().anyMatch(progress -> progress.processedGames() >= 1));
         assertEquals(0, database.getStatus().gameCount());
         assertTrue(database.findGames(
-                new GameSearch(null, null, null, null, null, null, null, 50)).isEmpty());
+                new GameSearch(null, null, null, null, null, null, null, null, 50)).isEmpty());
         assertTrue(database.findPosition(List.of(), 0).moves().isEmpty());
     }
 

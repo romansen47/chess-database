@@ -370,7 +370,7 @@ public class SqliteChessDatabase implements ChessDatabase {
     @Override
     public List<GameSummary> findGames(GameSearch search) throws SQLException {
         GameSearch criteria = search == null
-                ? new GameSearch(null, null, null, null, null, null, null, 200)
+                ? new GameSearch(null, null, null, null, null, null, null, null, 200)
                 : search;
         StringBuilder sql = new StringBuilder(
                 """
@@ -387,6 +387,12 @@ public class SqliteChessDatabase implements ChessDatabase {
         if (criteria.player() != null) {
             sql.append(" AND (w.normalized_name LIKE ? ESCAPE '\\' OR b.normalized_name LIKE ? ESCAPE '\\')");
             String pattern = containsPattern(criteria.player());
+            parameters.add(pattern);
+            parameters.add(pattern);
+        }
+        if (criteria.player2() != null) {
+            sql.append(" AND (w.normalized_name LIKE ? ESCAPE '\\' OR b.normalized_name LIKE ? ESCAPE '\\')");
+            String pattern = containsPattern(criteria.player2());
             parameters.add(pattern);
             parameters.add(pattern);
         }

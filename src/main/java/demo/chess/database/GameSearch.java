@@ -5,7 +5,8 @@ package demo.chess.database;
  *
  * @param white white player name fragment
  * @param black black player name fragment
- * @param player either player name fragment
+ * @param player first color-independent player name fragment
+ * @param player2 second color-independent player name fragment
  * @param fromYear minimum year
  * @param toYear maximum year
  * @param result exact PGN result or null
@@ -16,11 +17,36 @@ public record GameSearch(
         String white,
         String black,
         String player,
+        String player2,
         Integer fromYear,
         Integer toYear,
         String result,
         Integer minElo,
         int limit) {
+
+    /**
+     * Backward-compatible constructor without a second color-independent player.
+     *
+     * @param white white player name fragment
+     * @param black black player name fragment
+     * @param player either player name fragment
+     * @param fromYear minimum year
+     * @param toYear maximum year
+     * @param result exact PGN result or null
+     * @param minElo minimum rating required for both players
+     * @param limit maximum number of results
+     */
+    public GameSearch(
+            String white,
+            String black,
+            String player,
+            Integer fromYear,
+            Integer toYear,
+            String result,
+            Integer minElo,
+            int limit) {
+        this(white, black, player, null, fromYear, toYear, result, minElo, limit);
+    }
 
     /**
      * Normalizes nullable strings and result limits.
@@ -29,6 +55,7 @@ public record GameSearch(
         white = normalize(white);
         black = normalize(black);
         player = normalize(player);
+        player2 = normalize(player2);
         result = normalize(result);
         if ("any".equalsIgnoreCase(result)) {
             result = null;
