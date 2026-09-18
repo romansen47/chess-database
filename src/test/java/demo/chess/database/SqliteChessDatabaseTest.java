@@ -132,6 +132,42 @@ class SqliteChessDatabaseTest {
         assertEquals(1, initialPosition.moves().get(0).games());
     }
 
+    @Test
+    void keepsLegacyPosition518StorageCompatibleWhileExposingUnifiedUci() throws Exception {
+        String pgn = """
+                [Event "Position 518 castling"]
+                [Site "?"]
+                [Date "2026.09.18"]
+                [Round "1"]
+                [White "White"]
+                [Black "Black"]
+                [Result "*"]
+
+                1. Nf3 Nf6 2. g3 g6 3. Bg2 Bg7 4. O-O O-O *
+                """;
+
+        SqliteChessDatabase database =
+                new SqliteChessDatabase(tempDirectory.resolve("position-518-castling.db"));
+        database.importPgn(new ByteArrayInputStream(pgn.getBytes(StandardCharsets.UTF_8)));
+
+        long id = database.findGameId(pgn);
+        StoredGame stored = database.getGame(id);
+
+        assertEquals("e1h1", stored.uciMoves().get(6));
+        assertEquals("e8h8", stored.uciMoves().get(7));
+
+        PositionStatistics beforeWhiteCastle = database.findPosition(
+                518,
+                stored.uciMoves(),
+                6);
+        assertEquals("e1h1", beforeWhiteCastle.moves().get(0).move());
+
+        String reconstructed = database.getGameAsPgn(id);
+        assertTrue(reconstructed.contains("O-O"));
+        assertTrue(reconstructed.contains("[Variant \"Chess960\"]"));
+        assertTrue(reconstructed.contains("[SetUp \"1\"]"));
+    }
+
     /**
      * Verifies cancellation removes the entire staged import and emits useful progress.
      */

@@ -165,7 +165,9 @@ public class SqliteChessDatabase implements ChessDatabase {
                                     startingPosition = null;
                                 } else {
                                     startingPosition = gameLoader.parsePgnStartingPosition(pgn);
-                                    moves = gameLoader.parsePgnMoveList(pgn);
+                                    moves = LegacyDatabaseMoveAdapter.toStorage(
+                                            startingPosition,
+                                            gameLoader.parsePgnMoveList(pgn));
                                 }
                             } finally {
                                 parsingNanos += System.nanoTime() - parseStarted;
@@ -422,7 +424,24 @@ public class SqliteChessDatabase implements ChessDatabase {
             statement.setLong(1, id);
             try (ResultSet rs = statement.executeQuery()) {
                 if (!rs.next()) throw new NoSuchElementException("Chess database game not found: " + id);
-                return new StoredGame(id, decodeTags(rs.getString(1)), MoveCodec.decodeMoves(rs.getBytes(2)), rs.getInt(3));
+                int startingPositionId = rs.getInt(3);
+                ChessStartingPosition startingPosition =
+                        ChessStartingPosition.of(startingPositionId);
+                try {
+                    List<String> protocolMoves = LegacyDatabaseMoveAdapter.fromStorage(
+                            startingPosition,
+                            MoveCodec.decodeMoves(rs.getBytes(2)));
+                    return new StoredGame(
+                            id,
+                            decodeTags(rs.getString(1)),
+                            protocolMoves,
+                            startingPositionId);
+                } catch (NoMoveFoundException | IOException e) {
+                    throw new SQLException(
+                            "Could not decode stored game " + id
+                                    + " for starting position " + startingPositionId,
+                            e);
+                }
             }
         }
     }
@@ -446,7 +465,9 @@ public class SqliteChessDatabase implements ChessDatabase {
     public long findGameId(String pgn) throws SQLException, IOException, NoMoveFoundException {
         Map<String, String> tags = gameLoader.parsePgnTags(pgn);
         ChessStartingPosition startingPosition = gameLoader.parsePgnStartingPosition(pgn);
-        List<String> moves = gameLoader.parsePgnMoveList(pgn);
+        List<String> moves = LegacyDatabaseMoveAdapter.toStorage(
+                startingPosition,
+                gameLoader.parsePgnMoveList(pgn));
         byte[] encodedMoves = MoveCodec.encodeMoves(moves);
         try (Connection connection = openConnection();
                 PreparedStatement statement = connection.prepareStatement(
@@ -501,9 +522,15 @@ public class SqliteChessDatabase implements ChessDatabase {
 
     @Override
     public PositionStatistics findPosition(int startingPositionId, List<String> uciMoves, int ply) throws SQLException {
-        ChessStartingPosition.of(startingPositionId);
-        List<String> moves = uciMoves == null ? List.of() : uciMoves;
-        int safePly = Math.max(0, Math.min(ply, moves.size()));
+        ChessStartingPosition startingPosition = ChessStartingPosition.of(startingPositionId);
+        List<String> protocolMoves = uciMoves == null ? List.of() : List.copyOf(uciMoves);
+        int safePly = Math.max(0, Math.min(ply, protocolMoves.size()));
+        List<String> moves;
+        try {
+            moves = LegacyDatabaseMoveAdapter.toStorage(startingPosition, protocolMoves);
+        } catch (NoMoveFoundException | IOException e) {
+            throw new SQLException("Could not encode position lookup moves", e);
+        }
         PositionHash hash = ZobristPositionHasher.hashAfterMoves(startingPositionId, moves, safePly);
         try (Connection connection = openConnection();
                 PreparedStatement statement = connection.prepareStatement(
@@ -518,8 +545,24 @@ public class SqliteChessDatabase implements ChessDatabase {
             List<PositionMoveStatistics> result = new ArrayList<>();
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
+                    String storageMove = MoveCodec.decode(rs.getInt(1));
+                    String protocolMove;
+                    try {
+                        protocolMove = LegacyDatabaseMoveAdapter.nextMoveFromStorage(
+                                startingPosition,
+                                protocolMoves.subList(0, safePly),
+                                storageMove);
+                    } catch (NoMoveFoundException | IOException e) {
+                        throw new SQLException(
+                                "Could not decode position continuation " + storageMove,
+                                e);
+                    }
                     result.add(new PositionMoveStatistics(
-                            MoveCodec.decode(rs.getInt(1)), rs.getLong(2), rs.getLong(3), rs.getLong(4), rs.getLong(5)));
+                            protocolMove,
+                            rs.getLong(2),
+                            rs.getLong(3),
+                            rs.getLong(4),
+                            rs.getLong(5)));
                 }
             }
             return new PositionStatistics(hash, result);
