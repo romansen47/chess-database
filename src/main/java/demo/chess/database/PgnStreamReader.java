@@ -11,6 +11,8 @@ final class PgnStreamReader implements AutoCloseable {
 
     private final BufferedReader reader;
     private String pendingLine;
+    private boolean inBraceComment;
+    private int variationDepth;
 
     /**
      * Creates a streaming PGN reader.
@@ -35,7 +37,8 @@ final class PgnStreamReader implements AutoCloseable {
         String line = takeLine();
         while (line != null) {
             String trimmed = line.trim();
-            boolean tagLine = trimmed.startsWith("[") && trimmed.endsWith("]");
+            boolean tagLine = !inBraceComment && variationDepth == 0
+                    && trimmed.matches("\\[[A-Za-z0-9_]+\\s+\".*\"\\]");
 
             if (game.length() == 0 && trimmed.isEmpty()) {
                 line = reader.readLine();
@@ -50,6 +53,20 @@ final class PgnStreamReader implements AutoCloseable {
             game.append(line).append('\n');
             if (!trimmed.isEmpty() && !tagLine) {
                 seenMoveText = true;
+                for (int i = 0; i < line.length(); i++) {
+                    char c = line.charAt(i);
+                    if (inBraceComment) {
+                        if (c == '}') inBraceComment = false;
+                    } else if (c == ';') {
+                        break;
+                    } else if (c == '{') {
+                        inBraceComment = true;
+                    } else if (c == '(') {
+                        variationDepth++;
+                    } else if (c == ')' && variationDepth > 0) {
+                        variationDepth--;
+                    }
+                }
             }
 
             line = reader.readLine();

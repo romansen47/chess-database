@@ -36,7 +36,7 @@ import demo.chess.save.GameSaver;
 /** SQLite-backed implementation of the local chess database. */
 public class SqliteChessDatabase implements ChessDatabase {
 
-    public static final int SCHEMA_VERSION = 4;
+    public static final int SCHEMA_VERSION = 5;
     public static final int HASH_VERSION = 1;
     public static final int MOVE_CODEC_VERSION = 1;
 
@@ -112,12 +112,13 @@ public class SqliteChessDatabase implements ChessDatabase {
 
         try {
             try (Connection connection = openConnection();
+                    ImportedPgnAnnotations annotations = new ImportedPgnAnnotations(connection);
                     PgnStreamReader pgnReader = new PgnStreamReader(new InputStreamReader(countingInputStream, StandardCharsets.UTF_8));
                     PreparedStatement insertPlayer = connection.prepareStatement("INSERT OR IGNORE INTO player(name, normalized_name) VALUES (?, ?)");
                     PreparedStatement selectPlayer = connection.prepareStatement("SELECT id FROM player WHERE normalized_name = ?");
                     PreparedStatement findDuplicateGame = connection.prepareStatement(
                             """
-                            SELECT 1 FROM game
+                            SELECT id FROM game
                             WHERE white_player_id IS ? AND black_player_id IS ?
                               AND game_date IS ? AND round IS ? AND result = ?
                               AND starting_position_id = ? AND ply_count = ? AND moves = ?
@@ -199,7 +200,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                                     Long blackId = findOrCreatePlayer(insertPlayer, selectPlayer, playerCache, tags.get("Black"));
                                     String date = normalizeTag(tags.get("Date"));
                                     String round = normalizeTag(tags.get("Round"));
-                                    duplicate = isDuplicateGame(
+                                    Long gameId = findDuplicateGameId(
                                             findDuplicateGame,
                                             whiteId,
                                             blackId,
@@ -210,6 +211,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                                             moves.size(),
                                             encodedMoves);
 
+                                    duplicate = gameId != null;
                                     if (duplicate) {
                                         skippedGames++;
                                     } else {
@@ -230,7 +232,13 @@ public class SqliteChessDatabase implements ChessDatabase {
                                         insertGame.setString(15, encodeTags(tags));
                                         insertGame.setString(16, importId);
                                         insertGame.executeUpdate();
+                                        try (Statement idStatement = connection.createStatement();
+                                                ResultSet idResult = idStatement.executeQuery("SELECT last_insert_rowid()")) {
+                                            if (!idResult.next()) throw new SQLException("Missing inserted game id");
+                                            gameId = idResult.getLong(1);
+                                        }
                                     }
+                                    annotations.stage(importId, gameId, pgn);
                                 } finally {
                                     databaseNanos += System.nanoTime() - dbStarted;
                                 }
@@ -275,7 +283,8 @@ public class SqliteChessDatabase implements ChessDatabase {
                     }
                     long finalizeStarted = System.nanoTime();
                     try {
-                        finalizeImport(connection, importId);
+                        finalizeImport(connection, importId, cancelled);
+                        checkCancellation(cancelled);
                         connection.commit();
                     } finally {
                         finalizeNanos += System.nanoTime() - finalizeStarted;
@@ -508,14 +517,7 @@ public class SqliteChessDatabase implements ChessDatabase {
         if (pgn == null || pgn.isBlank()) throw new IllegalArgumentException("Annotated PGN must not be blank.");
         try (Connection connection = openConnection();
                 PreparedStatement exists = connection.prepareStatement("SELECT 1 FROM game WHERE id = ? AND import_id IS NULL");
-                PreparedStatement upsert = connection.prepareStatement(
-                        """
-                        INSERT INTO game_annotation(game_id, annotated_pgn, updated_at)
-                        VALUES (?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(game_id) DO UPDATE SET
-                            annotated_pgn = excluded.annotated_pgn,
-                            updated_at = CURRENT_TIMESTAMP
-                        """)) {
+                PreparedStatement upsert = connection.prepareStatement(ImportedPgnAnnotations.SAVE_PGN)) {
             exists.setLong(1, id);
             try (ResultSet rs = exists.executeQuery()) {
                 if (!rs.next()) throw new NoSuchElementException("Chess database game not found: " + id);
@@ -664,6 +666,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                         PRIMARY KEY(import_id, hash_hi, hash_lo, move_code)
                     )
                     """);
+            ImportedPgnAnnotations.createSchema(statement);
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_white_player ON game(white_player_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_black_player ON game(black_player_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_year ON game(game_year)");
@@ -701,6 +704,7 @@ public class SqliteChessDatabase implements ChessDatabase {
 
     private void cleanupStaleImports(Connection connection) throws SQLException {
         try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("DELETE FROM game_annotation_stage");
             statement.executeUpdate("DELETE FROM position_move_stage");
             statement.executeUpdate("DELETE FROM game WHERE import_id IS NOT NULL");
             statement.executeUpdate(
@@ -714,7 +718,8 @@ public class SqliteChessDatabase implements ChessDatabase {
         }
     }
 
-    private void finalizeImport(Connection connection, String importId) throws SQLException {
+    private void finalizeImport(Connection connection, String importId, BooleanSupplier cancelled) throws SQLException, IOException {
+        ImportedPgnAnnotations.publish(connection, importId, cancelled);
         try (PreparedStatement merge = connection.prepareStatement(
                     """
                     INSERT INTO position_move(hash_hi, hash_lo, move_code, games, white_wins, draws, black_wins)
@@ -737,6 +742,7 @@ public class SqliteChessDatabase implements ChessDatabase {
     private void cleanupImport(String importId) throws SQLException {
         try (Connection connection = openConnection()) {
             connection.setAutoCommit(false);
+            ImportedPgnAnnotations.cleanup(connection, importId);
             try (PreparedStatement deletePositions = connection.prepareStatement("DELETE FROM position_move_stage WHERE import_id = ?");
                     PreparedStatement deleteGames = connection.prepareStatement("DELETE FROM game WHERE import_id = ?")) {
                 deletePositions.setString(1, importId); deletePositions.executeUpdate();
@@ -821,7 +827,7 @@ public class SqliteChessDatabase implements ChessDatabase {
         }
     }
 
-    private boolean isDuplicateGame(
+    private Long findDuplicateGameId(
             PreparedStatement statement,
             Long whiteId,
             Long blackId,
@@ -839,7 +845,7 @@ public class SqliteChessDatabase implements ChessDatabase {
         statement.setInt(6, startingPositionId);
         statement.setInt(7, plyCount);
         statement.setBytes(8, encodedMoves);
-        try (ResultSet rs = statement.executeQuery()) { return rs.next(); }
+        try (ResultSet rs = statement.executeQuery()) { return rs.next() ? rs.getLong(1) : null; }
     }
 
     private Map<String, Long> createPlayerCache() {
