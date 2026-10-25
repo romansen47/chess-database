@@ -32,29 +32,56 @@ public final class ZobristPositionHasher {
     private ZobristPositionHasher() {
     }
 
-    /** Creates a cursor at classical Scharnagl position 518. */
+    /**
+     * Creates a cursor at classical Scharnagl position 518.
+     *
+     * @return mutable position cursor
+     */
     public static Cursor newCursor() {
         return new Cursor(ChessStartingPosition.STANDARD);
     }
 
-    /** Creates a cursor at one Scharnagl position. */
+    /**
+     * Creates a cursor at one Scharnagl position.
+     *
+     * @param startingPositionId Scharnagl starting-position identifier
+     * @return mutable position cursor
+     */
     public static Cursor newCursor(int startingPositionId) {
         return new Cursor(ChessStartingPosition.of(startingPositionId));
     }
 
-    /** Creates a cursor at one Scharnagl position. */
+    /**
+     * Creates a cursor at one Chess960 starting position.
+     *
+     * @param startingPosition starting position; {@code null} means standard
+     * @return mutable position cursor
+     */
     public static Cursor newCursor(ChessStartingPosition startingPosition) {
         return new Cursor(startingPosition == null
                 ? ChessStartingPosition.STANDARD
                 : startingPosition);
     }
 
-    /** Computes a classical position hash after a move prefix. */
+    /**
+     * Computes a classical position hash after a move prefix.
+     *
+     * @param moves UCI move history
+     * @param ply number of half-moves to apply
+     * @return deterministic 128-bit position hash
+     */
     public static PositionHash hashAfterMoves(List<String> moves, int ply) {
         return hashAfterMoves(ChessStartingPosition.STANDARD_ID, moves, ply);
     }
 
-    /** Computes a position hash after a move prefix from one Chess960 start id. */
+    /**
+     * Computes a position hash after a move prefix from one Chess960 start id.
+     *
+     * @param startingPositionId Scharnagl starting-position identifier
+     * @param moves UCI move history
+     * @param ply number of half-moves to apply
+     * @return deterministic 128-bit position hash
+     */
     public static PositionHash hashAfterMoves(
             int startingPositionId,
             List<String> moves,
@@ -90,6 +117,11 @@ public final class ZobristPositionHasher {
             initializeHash();
         }
 
+        /**
+         * Returns the hash of the cursor's current position.
+         *
+         * @return current 128-bit position hash
+         */
         public PositionHash hash() {
             return new PositionHash(high, low);
         }
@@ -97,6 +129,8 @@ public final class ZobristPositionHasher {
         /**
          * Applies one UCI move. Chess960 castling follows the UCI convention
          * king-source -> original-rook-source.
+         *
+         * @param rawMove UCI move to apply
          */
         public void apply(String rawMove) {
             String move = normalizeMove(rawMove);
