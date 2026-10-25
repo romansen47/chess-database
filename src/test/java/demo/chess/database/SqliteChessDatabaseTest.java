@@ -247,6 +247,69 @@ class SqliteChessDatabaseTest {
     }
 
     @Test
+    void updatesSearchableMetadataAndResultStatisticsWhenAnnotatedPgnChanges() throws Exception {
+        String pgn = """
+                [Event "Original Event"]
+                [Site "Original Site"]
+                [Date "2026.10.01"]
+                [Round "1"]
+                [White "Alpha"]
+                [Black "Beta"]
+                [WhiteElo "2400"]
+                [BlackElo "2300"]
+                [Result "1-0"]
+                [ECO "C20"]
+
+                1. e4 e5 2. Nf3 Nc6 1-0
+                """;
+
+        SqliteChessDatabase database =
+                new SqliteChessDatabase(tempDirectory.resolve("metadata-update.db"));
+        database.importPgn(new ByteArrayInputStream(pgn.getBytes(StandardCharsets.UTF_8)));
+        long gameId = database.findGameId(pgn);
+
+        PositionMoveStatistics before = database.findPosition(List.of(), 0).moves().get(0);
+        assertEquals(1, before.whiteWins());
+        assertEquals(0, before.blackWins());
+
+        String updated = """
+                [Event "Edited Event"]
+                [Site "Stuttgart"]
+                [Date "2026.10.25"]
+                [Round "7"]
+                [White "Gamma"]
+                [Black "Delta"]
+                [WhiteElo "2550"]
+                [BlackElo "2520"]
+                [Result "0-1"]
+                [ECO "B00"]
+
+                1. e4 e5 2. Nf3 Nc6 0-1
+                """;
+        database.saveAnnotatedPgn(gameId, updated);
+
+        assertTrue(database.findGames(
+                new GameSearch(null, null, "alpha", null, null, null, null, null, 50)).isEmpty());
+        List<GameSummary> edited = database.findGames(
+                new GameSearch(null, null, "gamma", "delta", null, null, "0-1", 2500, 50));
+        assertEquals(1, edited.size());
+        assertEquals("Gamma", edited.get(0).white());
+        assertEquals("Delta", edited.get(0).black());
+        assertEquals(Integer.valueOf(2550), edited.get(0).whiteElo());
+        assertEquals(Integer.valueOf(2520), edited.get(0).blackElo());
+        assertEquals("Edited Event", edited.get(0).event());
+        assertEquals("B00", edited.get(0).eco());
+        assertEquals("0-1", edited.get(0).result());
+
+        PositionMoveStatistics after = database.findPosition(List.of(), 0).moves().get(0);
+        assertEquals(1, after.games());
+        assertEquals(0, after.whiteWins());
+        assertEquals(0, after.draws());
+        assertEquals(1, after.blackWins());
+        assertEquals(updated, database.getGameAsPgn(gameId));
+    }
+
+    @Test
     void migratesExistingDatabaseAndStoresAnnotatedPgnWithoutReimport() throws Exception {
         String pgn = """
                 [Event "Annotated"]
