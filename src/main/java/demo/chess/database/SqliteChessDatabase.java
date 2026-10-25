@@ -49,6 +49,13 @@ public class SqliteChessDatabase implements ChessDatabase {
     private final GameLoader gameLoader = new GameLoader();
     private final GameSaver gameSaver = new GameSaver();
 
+    /**
+     * Opens or creates the local SQLite chess database at the supplied path.
+     *
+     * @param databasePath database file path
+     * @throws SQLException when schema initialization fails
+     * @throws IOException when the parent directory cannot be created
+     */
     public SqliteChessDatabase(Path databasePath) throws SQLException, IOException {
         if (databasePath == null) throw new IllegalArgumentException("databasePath must not be null");
         this.databasePath = databasePath.toAbsolutePath().normalize();
@@ -57,6 +64,11 @@ public class SqliteChessDatabase implements ChessDatabase {
         initialize();
     }
 
+    /**
+     * Returns the configured database path or the default path below the user home.
+     *
+     * @return normalized database path
+     */
     public static Path defaultPath() {
         String configured = System.getProperty("chess.database.path");
         if (configured != null && !configured.isBlank()) {
