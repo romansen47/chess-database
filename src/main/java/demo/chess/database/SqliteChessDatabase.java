@@ -668,8 +668,6 @@ public class SqliteChessDatabase implements ChessDatabase {
                 }
                 cursor.apply(move);
             }
-        } catch (NoMoveFoundException | IOException e) {
-            throw new SQLException("Could not update position statistics for edited result.", e);
         }
     }
 
