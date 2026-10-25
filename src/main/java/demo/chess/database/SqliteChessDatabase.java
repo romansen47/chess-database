@@ -514,17 +514,184 @@ public class SqliteChessDatabase implements ChessDatabase {
 
     @Override
     public void saveAnnotatedPgn(long id, String pgn) throws SQLException {
-        if (pgn == null || pgn.isBlank()) throw new IllegalArgumentException("Annotated PGN must not be blank.");
-        try (Connection connection = openConnection();
-                PreparedStatement exists = connection.prepareStatement("SELECT 1 FROM game WHERE id = ? AND import_id IS NULL");
-                PreparedStatement upsert = connection.prepareStatement(ImportedPgnAnnotations.SAVE_PGN)) {
-            exists.setLong(1, id);
-            try (ResultSet rs = exists.executeQuery()) {
-                if (!rs.next()) throw new NoSuchElementException("Chess database game not found: " + id);
+        if (pgn == null || pgn.isBlank()) {
+            throw new IllegalArgumentException("Annotated PGN must not be blank.");
+        }
+
+        final Map<String, String> tags;
+        final ChessStartingPosition parsedStartingPosition;
+        final List<String> parsedMoves;
+        try {
+            tags = gameLoader.parsePgnTags(pgn);
+            parsedStartingPosition = gameLoader.parsePgnStartingPosition(pgn);
+            parsedMoves = LegacyDatabaseMoveAdapter.toStorage(
+                    parsedStartingPosition,
+                    gameLoader.parsePgnMoveList(pgn));
+        } catch (NoMoveFoundException | IOException | IllegalArgumentException e) {
+            throw new SQLException("Could not validate annotated PGN metadata.", e);
+        }
+
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                StoredMetadata original = readStoredMetadata(connection, id);
+                if (original.startingPositionId() != parsedStartingPosition.getId()
+                        || !original.moves().equals(parsedMoves)) {
+                    throw new IllegalArgumentException(
+                            "Annotated PGN metadata update must not change the starting position or move history.");
+                }
+
+                Map<String, Long> playerCache = createPlayerCache();
+                try (PreparedStatement insertPlayer = connection.prepareStatement(
+                            "INSERT OR IGNORE INTO player(name, normalized_name) VALUES (?, ?)");
+                        PreparedStatement selectPlayer = connection.prepareStatement(
+                            "SELECT id FROM player WHERE normalized_name = ?");
+                        PreparedStatement updateGame = connection.prepareStatement(
+                            """
+                            UPDATE game SET
+                                white_player_id = ?,
+                                black_player_id = ?,
+                                white_elo = ?,
+                                black_elo = ?,
+                                event = ?,
+                                site = ?,
+                                game_date = ?,
+                                game_year = ?,
+                                round = ?,
+                                result = ?,
+                                eco = ?,
+                                tags = ?
+                            WHERE id = ? AND import_id IS NULL
+                            """);
+                        PreparedStatement upsert = connection.prepareStatement(
+                            ImportedPgnAnnotations.SAVE_PGN)) {
+                    Long whiteId = findOrCreatePlayer(
+                            insertPlayer, selectPlayer, playerCache, tags.get("White"));
+                    Long blackId = findOrCreatePlayer(
+                            insertPlayer, selectPlayer, playerCache, tags.get("Black"));
+                    String date = normalizeTag(tags.get("Date"));
+                    String newResult = normalizeResult(tags.get("Result"));
+
+                    if (!normalizeResult(original.result()).equals(newResult)) {
+                        adjustPositionResultStatistics(
+                                connection,
+                                parsedStartingPosition,
+                                parsedMoves,
+                                normalizeResult(original.result()),
+                                newResult);
+                    }
+
+                    bindNullableLong(updateGame, 1, whiteId);
+                    bindNullableLong(updateGame, 2, blackId);
+                    bindNullableInteger(updateGame, 3, parseInteger(tags.get("WhiteElo")));
+                    bindNullableInteger(updateGame, 4, parseInteger(tags.get("BlackElo")));
+                    updateGame.setString(5, normalizeTag(tags.get("Event")));
+                    updateGame.setString(6, normalizeTag(tags.get("Site")));
+                    updateGame.setString(7, date);
+                    bindNullableInteger(updateGame, 8, parseYear(date));
+                    updateGame.setString(9, normalizeTag(tags.get("Round")));
+                    updateGame.setString(10, newResult);
+                    updateGame.setString(11, normalizeTag(tags.get("ECO")));
+                    updateGame.setString(12, encodeTags(tags));
+                    updateGame.setLong(13, id);
+                    if (updateGame.executeUpdate() != 1) {
+                        throw new NoSuchElementException("Chess database game not found: " + id);
+                    }
+
+                    upsert.setLong(1, id);
+                    upsert.setString(2, pgn);
+                    upsert.executeUpdate();
+                }
+
+                cleanupOrphanPlayers(connection);
+                connection.commit();
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
             }
-            upsert.setLong(1, id);
-            upsert.setString(2, pgn);
-            upsert.executeUpdate();
+        }
+    }
+
+    private StoredMetadata readStoredMetadata(Connection connection, long id) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                """
+                SELECT result, starting_position_id, moves
+                FROM game
+                WHERE id = ? AND import_id IS NULL
+                """)) {
+            statement.setLong(1, id);
+            try (ResultSet rs = statement.executeQuery()) {
+                if (!rs.next()) {
+                    throw new NoSuchElementException("Chess database game not found: " + id);
+                }
+                return new StoredMetadata(
+                        rs.getString(1),
+                        rs.getInt(2),
+                        MoveCodec.decodeMoves(rs.getBytes(3)));
+            }
+        }
+    }
+
+    private void adjustPositionResultStatistics(
+            Connection connection,
+            ChessStartingPosition startingPosition,
+            List<String> moves,
+            String oldResult,
+            String newResult) throws SQLException {
+        ResultContribution oldContribution = resultContribution(oldResult);
+        ResultContribution newContribution = resultContribution(newResult);
+        int whiteDelta = newContribution.whiteWins() - oldContribution.whiteWins();
+        int drawDelta = newContribution.draws() - oldContribution.draws();
+        int blackDelta = newContribution.blackWins() - oldContribution.blackWins();
+        if (whiteDelta == 0 && drawDelta == 0 && blackDelta == 0) return;
+
+        ZobristPositionHasher.Cursor cursor = ZobristPositionHasher.newCursor(startingPosition);
+        try (PreparedStatement update = connection.prepareStatement(
+                """
+                UPDATE position_move
+                SET white_wins = white_wins + ?,
+                    draws = draws + ?,
+                    black_wins = black_wins + ?
+                WHERE hash_hi = ? AND hash_lo = ? AND move_code = ?
+                """)) {
+            for (String move : moves) {
+                PositionHash hash = cursor.hash();
+                update.setInt(1, whiteDelta);
+                update.setInt(2, drawDelta);
+                update.setInt(3, blackDelta);
+                update.setLong(4, hash.high());
+                update.setLong(5, hash.low());
+                update.setInt(6, MoveCodec.encode(move));
+                if (update.executeUpdate() != 1) {
+                    throw new SQLException(
+                            "Missing position aggregate while updating game result metadata.");
+                }
+                cursor.apply(move);
+            }
+        } catch (NoMoveFoundException | IOException e) {
+            throw new SQLException("Could not update position statistics for edited result.", e);
+        }
+    }
+
+    private ResultContribution resultContribution(String result) {
+        return switch (normalizeResult(result)) {
+            case "1-0" -> new ResultContribution(1, 0, 0);
+            case "0-1" -> new ResultContribution(0, 0, 1);
+            case "1/2-1/2" -> new ResultContribution(0, 1, 0);
+            default -> new ResultContribution(0, 0, 0);
+        };
+    }
+
+    private void cleanupOrphanPlayers(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate(
+                    """
+                    DELETE FROM player
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM game
+                        WHERE game.white_player_id = player.id OR game.black_player_id = player.id
+                    )
+                    """);
         }
     }
 
@@ -948,6 +1115,8 @@ public class SqliteChessDatabase implements ChessDatabase {
         return result;
     }
 
+    private record StoredMetadata(String result, int startingPositionId, List<String> moves) { }
+    private record ResultContribution(int whiteWins, int draws, int blackWins) { }
     private record PositionMoveKey(long hashHigh, long hashLow, int moveCode) { }
 
     private static final class PositionAggregate {
