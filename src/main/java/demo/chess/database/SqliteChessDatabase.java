@@ -393,43 +393,11 @@ public class SqliteChessDatabase implements ChessDatabase {
         GameSearch criteria = search == null
                 ? new GameSearch(null, null, null, null, null, null, null, null, 200)
                 : search;
-        StringBuilder sql = new StringBuilder(
-                """
-                SELECT g.id, g.game_date, COALESCE(w.name, '?'), COALESCE(b.name, '?'),
-                       g.white_elo, g.black_elo, g.result, g.event, g.eco, g.ply_count
-                FROM game g
-                LEFT JOIN player w ON w.id = g.white_player_id
-                LEFT JOIN player b ON b.id = g.black_player_id
-                WHERE g.import_id IS NULL
-                """);
-        List<Object> parameters = new ArrayList<>();
-        appendPlayerFilter(sql, parameters, "w.normalized_name", criteria.white());
-        appendPlayerFilter(sql, parameters, "b.normalized_name", criteria.black());
-        if (criteria.player() != null) {
-            sql.append(" AND (w.normalized_name LIKE ? ESCAPE '\\' OR b.normalized_name LIKE ? ESCAPE '\\')");
-            String pattern = containsPattern(criteria.player());
-            parameters.add(pattern);
-            parameters.add(pattern);
-        }
-        if (criteria.player2() != null) {
-            sql.append(" AND (w.normalized_name LIKE ? ESCAPE '\\' OR b.normalized_name LIKE ? ESCAPE '\\')");
-            String pattern = containsPattern(criteria.player2());
-            parameters.add(pattern);
-            parameters.add(pattern);
-        }
-        if (criteria.fromYear() != null) { sql.append(" AND g.game_year >= ?"); parameters.add(criteria.fromYear()); }
-        if (criteria.toYear() != null) { sql.append(" AND g.game_year <= ?"); parameters.add(criteria.toYear()); }
-        if (criteria.result() != null) { sql.append(" AND g.result = ?"); parameters.add(criteria.result()); }
-        if (criteria.minElo() != null) {
-            sql.append(" AND g.white_elo >= ? AND g.black_elo >= ?");
-            parameters.add(criteria.minElo());
-            parameters.add(criteria.minElo());
-        }
-        sql.append(" ORDER BY g.game_year DESC, g.game_date DESC, g.id DESC LIMIT ?");
-        parameters.add(criteria.limit());
+        GameSearchQueryBuilder.Query query = GameSearchQueryBuilder.build(criteria);
 
-        try (Connection connection = openConnection(); PreparedStatement statement = connection.prepareStatement(sql.toString())) {
-            bindParameters(statement, parameters);
+        try (Connection connection = openConnection();
+                PreparedStatement statement = connection.prepareStatement(query.sql())) {
+            bindParameters(statement, query.parameters());
             List<GameSummary> result = new ArrayList<>();
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
@@ -1072,6 +1040,7 @@ public class SqliteChessDatabase implements ChessDatabase {
             Object value = parameters.get(index);
             if (value instanceof Integer integer) statement.setInt(index + 1, integer);
             else if (value instanceof Long longValue) statement.setLong(index + 1, longValue);
+            else if (value instanceof byte[] bytes) statement.setBytes(index + 1, bytes);
             else statement.setString(index + 1, String.valueOf(value));
         }
     }
