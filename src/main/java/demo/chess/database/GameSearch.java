@@ -1,5 +1,7 @@
 package demo.chess.database;
 
+import java.util.List;
+
 /**
  * Search criteria for locally stored games.
  *
@@ -11,6 +13,9 @@ package demo.chess.database;
  * @param toYear maximum year
  * @param result exact PGN result or null
  * @param minElo minimum rating required for both players
+ * @param eco ECO code prefix or null
+ * @param openingStartingPositionId starting position required by an opening filter
+ * @param openingMoves UCI move prefix required by an opening filter
  * @param limit maximum number of results
  */
 public record GameSearch(
@@ -22,19 +27,41 @@ public record GameSearch(
         Integer toYear,
         String result,
         Integer minElo,
+        String eco,
+        Integer openingStartingPositionId,
+        List<String> openingMoves,
         int limit) {
 
     /**
+     * Backward-compatible constructor without ECO or opening criteria.
+     */
+    public GameSearch(
+            String white,
+            String black,
+            String player,
+            String player2,
+            Integer fromYear,
+            Integer toYear,
+            String result,
+            Integer minElo,
+            int limit) {
+        this(
+                white,
+                black,
+                player,
+                player2,
+                fromYear,
+                toYear,
+                result,
+                minElo,
+                null,
+                null,
+                List.of(),
+                limit);
+    }
+
+    /**
      * Backward-compatible constructor without a second color-independent player.
-     *
-     * @param white white player name fragment
-     * @param black black player name fragment
-     * @param player either player name fragment
-     * @param fromYear minimum year
-     * @param toYear maximum year
-     * @param result exact PGN result or null
-     * @param minElo minimum rating required for both players
-     * @param limit maximum number of results
      */
     public GameSearch(
             String white,
@@ -48,27 +75,29 @@ public record GameSearch(
         this(white, black, player, null, fromYear, toYear, result, minElo, limit);
     }
 
-    /**
-     * Normalizes nullable strings and result limits.
-     */
+    /** Normalizes nullable strings, opening criteria and result limits. */
     public GameSearch {
         white = normalize(white);
         black = normalize(black);
         player = normalize(player);
         player2 = normalize(player2);
         result = normalize(result);
+        eco = normalize(eco);
         if ("any".equalsIgnoreCase(result)) {
             result = null;
         }
+
+        openingMoves = openingMoves == null ? List.of() : List.copyOf(openingMoves);
+        boolean hasOpeningId = openingStartingPositionId != null;
+        boolean hasOpeningMoves = !openingMoves.isEmpty();
+        if (hasOpeningId != hasOpeningMoves) {
+            throw new IllegalArgumentException(
+                    "Opening search requires both starting position and moves");
+        }
+
         limit = Math.max(1, Math.min(limit <= 0 ? 200 : limit, 500));
     }
 
-    /**
-     * Normalizes a text search value.
-     *
-     * @param value source value
-     * @return trimmed value or null
-     */
     private static String normalize(String value) {
         if (value == null || value.isBlank()) {
             return null;
