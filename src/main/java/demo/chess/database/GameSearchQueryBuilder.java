@@ -63,22 +63,36 @@ final class GameSearchQueryBuilder {
             StringBuilder sql,
             List<Object> parameters,
             GameSearch criteria) throws SQLException {
-        if (criteria.openingMoves().isEmpty()) {
+        if (criteria.openingLines().isEmpty()) {
             return;
         }
 
+        sql.append(" AND (");
+        for (int index = 0; index < criteria.openingLines().size(); index++) {
+            if (index > 0) {
+                sql.append(" OR ");
+            }
+            appendExactOpeningLine(sql, parameters, criteria.openingLines().get(index));
+        }
+        sql.append(')');
+    }
+
+    private static void appendExactOpeningLine(
+            StringBuilder sql,
+            List<Object> parameters,
+            OpeningLineSearch line) throws SQLException {
         try {
             ChessStartingPosition startingPosition =
-                    ChessStartingPosition.of(criteria.openingStartingPositionId());
+                    ChessStartingPosition.of(line.startingPositionId());
             List<String> storageMoves = LegacyDatabaseMoveAdapter.toStorage(
                     startingPosition,
-                    criteria.openingMoves());
+                    line.moves());
             byte[] prefix = MoveCodec.encodeMoves(storageMoves);
 
             sql.append(
-                    " AND g.starting_position_id = ?"
+                    "(g.starting_position_id = ?"
                             + " AND g.ply_count >= ?"
-                            + " AND substr(g.moves, 1, ?) = ?");
+                            + " AND substr(g.moves, 1, ?) = ?)");
             parameters.add(startingPosition.getId());
             parameters.add(storageMoves.size());
             parameters.add(prefix.length);
