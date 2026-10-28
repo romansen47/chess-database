@@ -32,8 +32,6 @@ import java.util.Map;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
-import demo.chess.database.ChessDatabase.ImportProgress;
-import demo.chess.database.ChessDatabase.ImportResult;
 import demo.chess.definitions.ChessStartingPosition;
 import demo.chess.definitions.engines.impl.NoMoveFoundException;
 import demo.chess.load.GameLoader;
