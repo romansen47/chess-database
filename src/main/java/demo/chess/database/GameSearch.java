@@ -14,8 +14,7 @@ import java.util.List;
  * @param result exact PGN result or null
  * @param minElo minimum rating required for both players
  * @param eco ECO code prefix or null
- * @param openingStartingPositionId starting position required by an opening filter
- * @param openingMoves UCI move prefix required by an opening filter
+ * @param openingLines exact move-order prefixes; matches any one of them
  * @param limit maximum number of results
  */
 public record GameSearch(
@@ -28,13 +27,10 @@ public record GameSearch(
         String result,
         Integer minElo,
         String eco,
-        Integer openingStartingPositionId,
-        List<String> openingMoves,
+        List<OpeningLineSearch> openingLines,
         int limit) {
 
-    /**
-     * Backward-compatible constructor without ECO or opening criteria.
-     */
+    /** Backward-compatible constructor without ECO or opening criteria. */
     public GameSearch(
             String white,
             String black,
@@ -46,23 +42,12 @@ public record GameSearch(
             Integer minElo,
             int limit) {
         this(
-                white,
-                black,
-                player,
-                player2,
-                fromYear,
-                toYear,
-                result,
-                minElo,
-                null,
-                null,
-                List.of(),
-                limit);
+                white, black, player, player2,
+                fromYear, toYear, result, minElo,
+                null, List.of(), limit);
     }
 
-    /**
-     * Backward-compatible constructor without a second color-independent player.
-     */
+    /** Backward-compatible constructor without a second color-independent player. */
     public GameSearch(
             String white,
             String black,
@@ -86,15 +71,7 @@ public record GameSearch(
         if ("any".equalsIgnoreCase(result)) {
             result = null;
         }
-
-        openingMoves = openingMoves == null ? List.of() : List.copyOf(openingMoves);
-        boolean hasOpeningId = openingStartingPositionId != null;
-        boolean hasOpeningMoves = !openingMoves.isEmpty();
-        if (hasOpeningId != hasOpeningMoves) {
-            throw new IllegalArgumentException(
-                    "Opening search requires both starting position and moves");
-        }
-
+        openingLines = openingLines == null ? List.of() : List.copyOf(openingLines);
         limit = Math.max(1, Math.min(limit <= 0 ? 200 : limit, 500));
     }
 
