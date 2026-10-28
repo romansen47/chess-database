@@ -2,8 +2,9 @@ package demo.chess.database;
 
 import static demo.chess.database.SqliteDatabaseSupport.bindNullableInteger;
 import static demo.chess.database.SqliteDatabaseSupport.bindNullableLong;
+import static demo.chess.database.SqliteDatabaseSupport.createPlayerCache;
 import static demo.chess.database.SqliteDatabaseSupport.encodeTags;
-import static demo.chess.database.SqliteDatabaseSupport.normalizePlayerName;
+import static demo.chess.database.SqliteDatabaseSupport.findOrCreatePlayer;
 import static demo.chess.database.SqliteDatabaseSupport.normalizeResult;
 import static demo.chess.database.SqliteDatabaseSupport.normalizeTag;
 import static demo.chess.database.SqliteDatabaseSupport.openConnection;
@@ -25,7 +26,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -42,8 +42,6 @@ final class SqlitePgnImporter {
     private static final int COMMIT_GAME_BATCH = 10_000;
     private static final int POSITION_BATCH_SIZE = 5_000;
     private static final int POSITION_AGGREGATION_LIMIT = 100_000;
-    private static final int PLAYER_CACHE_SIZE = 10_000;
-
     private final Path databasePath;
     private final GameLoader gameLoader;
 
@@ -405,30 +403,6 @@ final class SqlitePgnImporter {
                 || "fischerrandom".equals(normalized);
     }
 
-    private Long findOrCreatePlayer(
-            PreparedStatement insertPlayer,
-            PreparedStatement selectPlayer,
-            Map<String, Long> playerCache,
-            String rawName) throws SQLException {
-        String displayName = normalizeTag(rawName);
-        if (displayName == null || "?".equals(displayName)) return null;
-        String normalized = normalizePlayerName(displayName);
-        Long cached = playerCache.get(normalized);
-        if (cached != null) return cached;
-        insertPlayer.setString(1, displayName);
-        insertPlayer.setString(2, normalized);
-        insertPlayer.executeUpdate();
-        selectPlayer.setString(1, normalized);
-        try (ResultSet resultSet = selectPlayer.executeQuery()) {
-            if (!resultSet.next()) {
-                throw new SQLException("Could not resolve player after insert: " + displayName);
-            }
-            long id = resultSet.getLong(1);
-            playerCache.put(normalized, id);
-            return id;
-        }
-    }
-
     private Long findDuplicateGameId(
             PreparedStatement statement,
             Long whiteId,
@@ -450,17 +424,6 @@ final class SqlitePgnImporter {
         try (ResultSet resultSet = statement.executeQuery()) {
             return resultSet.next() ? resultSet.getLong(1) : null;
         }
-    }
-
-    private Map<String, Long> createPlayerCache() {
-        return new LinkedHashMap<>(PLAYER_CACHE_SIZE + 1, 0.75f, true) {
-            private static final long serialVersionUID = 1L;
-
-            @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
-                return size() > PLAYER_CACHE_SIZE;
-            }
-        };
     }
 
     private void checkCancellation(BooleanSupplier cancellationRequested) throws ImportCancelledException {

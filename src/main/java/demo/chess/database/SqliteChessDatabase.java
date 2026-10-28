@@ -3,13 +3,17 @@ package demo.chess.database;
 import static demo.chess.database.SqliteDatabaseSupport.bindNullableInteger;
 import static demo.chess.database.SqliteDatabaseSupport.bindNullableLong;
 import static demo.chess.database.SqliteDatabaseSupport.bindParameters;
+import static demo.chess.database.SqliteDatabaseSupport.createPlayerCache;
 import static demo.chess.database.SqliteDatabaseSupport.decodeTags;
 import static demo.chess.database.SqliteDatabaseSupport.encodeTags;
+import static demo.chess.database.SqliteDatabaseSupport.findOrCreatePlayer;
 import static demo.chess.database.SqliteDatabaseSupport.normalizeLookupPlayer;
 import static demo.chess.database.SqliteDatabaseSupport.normalizePlayerName;
 import static demo.chess.database.SqliteDatabaseSupport.normalizeResult;
 import static demo.chess.database.SqliteDatabaseSupport.normalizeTag;
 import static demo.chess.database.SqliteDatabaseSupport.nullableInteger;
+import static demo.chess.database.SqliteDatabaseSupport.parseInteger;
+import static demo.chess.database.SqliteDatabaseSupport.parseYear;
 
 import java.io.IOException;
 import java.io.InputStream;

@@ -17,6 +17,7 @@ import java.util.Map;
 
 /** Shared SQLite binding and persisted-value codecs. */
 final class SqliteDatabaseSupport {
+    private static final int PLAYER_CACHE_SIZE = 10_000;
 
     private SqliteDatabaseSupport() { }
 
@@ -36,6 +37,41 @@ final class SqliteDatabaseSupport {
     static String normalizeLookupPlayer(String value) {
         String normalized = normalizeTag(value);
         return normalized == null || "?".equals(normalized) ? "" : normalizePlayerName(normalized);
+    }
+
+    static Long findOrCreatePlayer(
+            PreparedStatement insertPlayer,
+            PreparedStatement selectPlayer,
+            Map<String, Long> playerCache,
+            String rawName) throws SQLException {
+        String displayName = normalizeTag(rawName);
+        if (displayName == null || "?".equals(displayName)) return null;
+        String normalized = normalizePlayerName(displayName);
+        Long cached = playerCache.get(normalized);
+        if (cached != null) return cached;
+        insertPlayer.setString(1, displayName);
+        insertPlayer.setString(2, normalized);
+        insertPlayer.executeUpdate();
+        selectPlayer.setString(1, normalized);
+        try (ResultSet resultSet = selectPlayer.executeQuery()) {
+            if (!resultSet.next()) {
+                throw new SQLException("Could not resolve player after insert: " + displayName);
+            }
+            long id = resultSet.getLong(1);
+            playerCache.put(normalized, id);
+            return id;
+        }
+    }
+
+    static Map<String, Long> createPlayerCache() {
+        return new LinkedHashMap<>(PLAYER_CACHE_SIZE + 1, 0.75f, true) {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+                return size() > PLAYER_CACHE_SIZE;
+            }
+        };
     }
 
     static String normalizeTag(String value) {
