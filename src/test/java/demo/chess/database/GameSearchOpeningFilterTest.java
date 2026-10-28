@@ -40,6 +40,45 @@ class GameSearchOpeningFilterTest {
     }
 
     @Test
+    void variationSearchMatchesAnyExplicitMoveOrderButNotUnlistedTranspositions() throws Exception {
+        String pgn = """
+                [Event "Move order A"]
+                [White "A"]
+                [Black "B"]
+                [Result "*"]
+
+                1. Nf3 Nf6 2. c4 g6 3. Nc3 Bg7 4. d4 O-O *
+
+                [Event "Move order B"]
+                [White "C"]
+                [Black "D"]
+                [Result "*"]
+
+                1. d4 Nf6 2. c4 g6 3. Nc3 Bg7 4. Nf3 O-O *
+                """;
+        SqliteChessDatabase database =
+                new SqliteChessDatabase(tempDirectory.resolve("move-orders.db"));
+        database.importPgn(new ByteArrayInputStream(pgn.getBytes(StandardCharsets.UTF_8)));
+
+        OpeningLineSearch first = new OpeningLineSearch(
+                518, List.of("g1f3", "g8f6", "c2c4", "g7g6"));
+        OpeningLineSearch second = new OpeningLineSearch(
+                518, List.of("d2d4", "g8f6", "c2c4", "g7g6"));
+
+        GameSearch both = new GameSearch(
+                null, null, null, null,
+                null, null, null, null,
+                null, List.of(first, second), 50);
+        assertEquals(2, database.findGames(both).size());
+
+        GameSearch firstOnly = new GameSearch(
+                null, null, null, null,
+                null, null, null, null,
+                null, List.of(first), 50);
+        assertEquals(1, database.findGames(firstOnly).size());
+    }
+
+    @Test
     void openingPrefixUsesUnifiedUciAcrossLegacyPosition518Storage() throws Exception {
         SqliteChessDatabase database =
                 new SqliteChessDatabase(tempDirectory.resolve("castling-search.db"));
@@ -59,10 +98,13 @@ class GameSearchOpeningFilterTest {
     }
 
     private GameSearch search(String eco, Integer startingPositionId, List<String> moves) {
+        List<OpeningLineSearch> openingLines = startingPositionId == null || moves.isEmpty()
+                ? List.of()
+                : List.of(new OpeningLineSearch(startingPositionId, moves));
         return new GameSearch(
                 null, null, null, null,
                 null, null, null, null,
-                eco, startingPositionId, moves, 50);
+                eco, openingLines, 50);
     }
 
     private String fixture() {
