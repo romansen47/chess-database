@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.Test;
@@ -142,6 +143,60 @@ class SqliteChessDatabaseTest {
         assertEquals(1, initialPosition.moves().size());
         assertEquals("e2e4", initialPosition.moves().get(0).move());
         assertEquals(1, initialPosition.moves().get(0).games());
+    }
+
+    @Test
+    void deletesGameAndRemovesItsPositionStatistics() throws Exception {
+        String pgn = """
+                [Event "Delete One"]
+                [Date "2026.10.29"]
+                [Round "1"]
+                [White "Delete, Alice"]
+                [Black "Shared, Bob"]
+                [Result "1-0"]
+
+                1. e4 e5 2. Nf3 1-0
+
+                [Event "Keep Two"]
+                [Date "2026.10.29"]
+                [Round "2"]
+                [White "Keep, Carol"]
+                [Black "Shared, Bob"]
+                [Result "0-1"]
+
+                1. e4 c5 2. Nf3 0-1
+                """;
+        SqliteChessDatabase database = new SqliteChessDatabase(
+                tempDirectory.resolve("delete.db"));
+        database.importPgn(new ByteArrayInputStream(
+                pgn.getBytes(StandardCharsets.UTF_8)));
+
+        GameSummary deleted = database.findGames(
+                new GameSearch(null, null, "Delete, Alice", null, null,
+                        null, null, null, 10)).get(0);
+        database.deleteGame(deleted.id());
+
+        assertEquals(1, database.getStatus().gameCount());
+        assertTrue(database.findGames(
+                new GameSearch(null, null, "Delete, Alice", null, null,
+                        null, null, null, 10)).isEmpty());
+        assertThrows(NoSuchElementException.class,
+                () -> database.getGame(deleted.id()));
+
+        PositionMoveStatistics e4 = database.findPosition(List.of(), 0)
+                .moves().get(0);
+        assertEquals("e2e4", e4.move());
+        assertEquals(1, e4.games());
+        assertEquals(0, e4.whiteWins());
+        assertEquals(0, e4.draws());
+        assertEquals(1, e4.blackWins());
+
+        long remainingId = database.findGames(
+                new GameSearch(null, null, "Keep, Carol", null, null,
+                        null, null, null, 10)).get(0).id();
+        database.deleteGame(remainingId);
+        assertEquals(0, database.getStatus().gameCount());
+        assertTrue(database.findPosition(List.of(), 0).moves().isEmpty());
     }
 
     @Test

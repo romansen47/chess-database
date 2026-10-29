@@ -165,6 +165,38 @@ public class SqliteChessDatabase implements ChessDatabase {
     }
 
     @Override
+    public void deleteGame(long id) throws SQLException {
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                StoredMetadata stored = readStoredMetadata(connection, id);
+                ChessStartingPosition startingPosition =
+                        ChessStartingPosition.of(stored.startingPositionId());
+                DeletedGameStatistics.remove(
+                        connection,
+                        startingPosition,
+                        stored.moves(),
+                        stored.result());
+
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "DELETE FROM game WHERE id = ? AND import_id IS NULL")) {
+                    statement.setLong(1, id);
+                    if (statement.executeUpdate() != 1) {
+                        throw new NoSuchElementException(
+                                "Chess database game not found: " + id);
+                    }
+                }
+
+                cleanupOrphanPlayers(connection);
+                connection.commit();
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+        }
+    }
+
+    @Override
     public String getGameAsPgn(long id) throws SQLException, IOException, NoMoveFoundException {
         try (Connection connection = openConnection();
                 PreparedStatement statement = connection.prepareStatement("SELECT annotated_pgn FROM game_annotation WHERE game_id = ?")) {

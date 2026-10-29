@@ -79,6 +79,15 @@ public interface ChessDatabase {
     StoredGame getGame(long id) throws SQLException;
 
     /**
+     * Deletes one stored game and removes its contribution from all position
+     * statistics.
+     *
+     * @param id database game id
+     * @throws SQLException when the game or its statistics cannot be updated
+     */
+    void deleteGame(long id) throws SQLException;
+
+    /**
      * Reconstructs one stored game as PGN.
      *
      * @param id database game id
