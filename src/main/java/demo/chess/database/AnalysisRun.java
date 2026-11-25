@@ -8,6 +8,7 @@ public record AnalysisRun(
         String gameKey,
         String engineName,
         String engineProfileId,
+        String profileName,
         int requestedDepth,
         int moveTimeSeconds,
         int multiPv,
@@ -22,6 +23,8 @@ public record AnalysisRun(
         }
         engineName = engineName == null ? "" : engineName;
         engineProfileId = engineProfileId == null ? "" : engineProfileId;
+        profileName = profileName == null || profileName.isBlank()
+                ? engineProfileId : profileName;
         optionsSnapshot = optionsSnapshot == null ? "" : optionsSnapshot;
         positions = positions == null ? List.of() : List.copyOf(positions);
     }

@@ -29,6 +29,7 @@ final class SqliteAnalysisRunStore {
                     game_key TEXT NOT NULL,
                     engine_name TEXT NOT NULL,
                     engine_profile_id TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
                     requested_depth INTEGER NOT NULL,
                     move_time_seconds INTEGER NOT NULL,
                     multi_pv INTEGER NOT NULL,
@@ -85,7 +86,7 @@ final class SqliteAnalysisRunStore {
         if (gameKey == null || gameKey.isBlank()) return List.of();
         try (Connection connection = openConnection();
                 PreparedStatement statement = connection.prepareStatement("""
-                        SELECT r.id, r.engine_name, r.engine_profile_id, r.requested_depth,
+                        SELECT r.id, r.engine_name, r.engine_profile_id, r.profile_name, r.requested_depth,
                                r.move_time_seconds, r.multi_pv, COUNT(p.ply),
                                COALESCE(MAX(p.depth), 0), r.created_at, r.active
                         FROM analysis_run r
@@ -99,10 +100,10 @@ final class SqliteAnalysisRunStore {
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
                     result.add(new AnalysisRunSummary(
-                            rs.getLong(1), rs.getString(2), rs.getString(3),
-                            rs.getInt(4), rs.getInt(5), rs.getInt(6),
-                            rs.getInt(7), rs.getInt(8), rs.getString(9),
-                            rs.getInt(10) != 0));
+                            rs.getLong(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                            rs.getInt(5), rs.getInt(6), rs.getInt(7),
+                            rs.getInt(8), rs.getInt(9), rs.getString(10),
+                            rs.getInt(11) != 0));
                 }
             }
             return result;
@@ -112,7 +113,7 @@ final class SqliteAnalysisRunStore {
     AnalysisRun get(long id) throws SQLException {
         try (Connection connection = openConnection();
                 PreparedStatement statement = connection.prepareStatement("""
-                        SELECT game_key, engine_name, engine_profile_id, requested_depth,
+                        SELECT game_key, engine_name, engine_profile_id, profile_name, requested_depth,
                                move_time_seconds, multi_pv, options_snapshot, created_at, active
                         FROM analysis_run WHERE id = ?
                         """)) {
@@ -120,9 +121,9 @@ final class SqliteAnalysisRunStore {
             try (ResultSet rs = statement.executeQuery()) {
                 if (!rs.next()) throw new NoSuchElementException("Analysis run not found: " + id);
                 return new AnalysisRun(
-                        id, rs.getString(1), rs.getString(2), rs.getString(3),
-                        rs.getInt(4), rs.getInt(5), rs.getInt(6), rs.getString(7),
-                        rs.getString(8), rs.getInt(9) != 0,
+                        id, rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                        rs.getInt(5), rs.getInt(6), rs.getInt(7), rs.getString(8),
+                        rs.getString(9), rs.getInt(10) != 0,
                         readPositions(connection, id));
             }
         }
@@ -150,17 +151,18 @@ final class SqliteAnalysisRunStore {
     private long insertRun(Connection connection, AnalysisRun run) throws SQLException {
         try (PreparedStatement insert = connection.prepareStatement("""
                 INSERT INTO analysis_run(
-                    game_key, engine_name, engine_profile_id, requested_depth,
+                    game_key, engine_name, engine_profile_id, profile_name, requested_depth,
                     move_time_seconds, multi_pv, options_snapshot, active)
-                VALUES(?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """, Statement.RETURN_GENERATED_KEYS)) {
             insert.setString(1, run.gameKey());
             insert.setString(2, run.engineName());
             insert.setString(3, run.engineProfileId());
-            insert.setInt(4, run.requestedDepth());
-            insert.setInt(5, run.moveTimeSeconds());
-            insert.setInt(6, run.multiPv());
-            insert.setString(7, run.optionsSnapshot());
+            insert.setString(4, run.profileName());
+            insert.setInt(5, run.requestedDepth());
+            insert.setInt(6, run.moveTimeSeconds());
+            insert.setInt(7, run.multiPv());
+            insert.setString(8, run.optionsSnapshot());
             insert.executeUpdate();
             try (ResultSet keys = insert.getGeneratedKeys()) {
                 if (!keys.next()) throw new SQLException("Could not create analysis run");

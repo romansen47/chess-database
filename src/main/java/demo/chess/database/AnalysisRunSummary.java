@@ -5,6 +5,7 @@ public record AnalysisRunSummary(
         long id,
         String engineName,
         String engineProfileId,
+        String profileName,
         int requestedDepth,
         int moveTimeSeconds,
         int multiPv,

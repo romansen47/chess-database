@@ -14,6 +14,7 @@ import static demo.chess.database.SqliteDatabaseSupport.normalizeTag;
 import static demo.chess.database.SqliteDatabaseSupport.nullableInteger;
 import static demo.chess.database.SqliteDatabaseSupport.parseInteger;
 import static demo.chess.database.SqliteDatabaseSupport.parseYear;
+import static demo.chess.database.SqliteSchemaSupport.ensureColumn;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -40,7 +41,7 @@ import demo.chess.save.GameSaver;
 /** SQLite-backed implementation of the local chess database. */
 public class SqliteChessDatabase implements ChessDatabase {
 
-    public static final int SCHEMA_VERSION = 6;
+    public static final int SCHEMA_VERSION = 7;
     public static final int HASH_VERSION = 1;
     public static final int MOVE_CODEC_VERSION = 1;
 
@@ -579,6 +580,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                     )
                     """);
             SqliteAnalysisRunStore.createSchema(statement);
+            ensureColumn(connection, "analysis_run", "profile_name", "TEXT NOT NULL DEFAULT ''");
             ImportedPgnAnnotations.createSchema(statement);
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_white_player ON game(white_player_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_black_player ON game(black_player_id)");
@@ -598,20 +600,6 @@ public class SqliteChessDatabase implements ChessDatabase {
             writeInfoIfAbsent(connection, "name", "Chess Database");
             writeInfo(connection, "schema_version", Integer.toString(SCHEMA_VERSION));
             cleanupStaleImports(connection);
-        }
-    }
-
-    private void ensureColumn(Connection connection, String table, String column, String definition) throws SQLException {
-        boolean found = false;
-        try (Statement statement = connection.createStatement(); ResultSet rs = statement.executeQuery("PRAGMA table_info(" + table + ")")) {
-            while (rs.next()) {
-                if (column.equalsIgnoreCase(rs.getString("name"))) { found = true; break; }
-            }
-        }
-        if (!found) {
-            try (Statement statement = connection.createStatement()) {
-                statement.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
-            }
         }
     }
 

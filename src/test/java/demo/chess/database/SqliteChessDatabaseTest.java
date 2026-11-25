@@ -8,6 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -287,6 +290,7 @@ class SqliteChessDatabaseTest {
 
         AnalysisRun stored = database.getAnalysisRun(firstId);
         assertEquals("Engine A", stored.engineName());
+        assertEquals("Profile profile-a", stored.profileName());
         assertEquals(2, stored.positions().size());
         assertEquals(List.of("g1f3", "b8c6"),
                 stored.positions().get(1).lines().get(0).uciMoves());
@@ -299,6 +303,44 @@ class SqliteChessDatabaseTest {
                 .findFirst().orElseThrow().active());
     }
 
+    @Test
+    void addsProfileNameWhenOpeningSchemaVersionSix() throws Exception {
+        Path path = tempDirectory.resolve("analysis-history-v6.db");
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + path);
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE database_info(key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            statement.execute(
+                    "INSERT INTO database_info(key, value) VALUES('schema_version', '6')");
+            statement.execute("""
+                    CREATE TABLE analysis_run(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        game_key TEXT NOT NULL,
+                        engine_name TEXT NOT NULL,
+                        engine_profile_id TEXT NOT NULL,
+                        requested_depth INTEGER NOT NULL,
+                        move_time_seconds INTEGER NOT NULL,
+                        multi_pv INTEGER NOT NULL,
+                        options_snapshot TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        active INTEGER NOT NULL DEFAULT 0
+                    )
+                    """);
+            statement.execute("""
+                    INSERT INTO analysis_run(
+                        game_key, engine_name, engine_profile_id, requested_depth,
+                        move_time_seconds, multi_pv, options_snapshot, active)
+                    VALUES('game', 'Engine', 'profile-id', 20, 5, 1, '', 1)
+                    """);
+        }
+
+        SqliteChessDatabase database = new SqliteChessDatabase(path);
+
+        AnalysisRun migrated = database.getAnalysisRun(1);
+        assertEquals("profile-id", migrated.profileName());
+        assertEquals(7, database.getStatus().schemaVersion());
+    }
+
     private AnalysisRun analysisRun(
             String gameKey,
             String engine,
@@ -308,7 +350,8 @@ class SqliteChessDatabaseTest {
             double evaluation,
             String bestMove) {
         return new AnalysisRun(
-                0L, gameKey, engine, profile, depth, 5, multiPv, "Threads=2",
+                0L, gameKey, engine, profile, "Profile " + profile,
+                depth, 5, multiPv, "Threads=2",
                 null, false,
                 List.of(
                         new AnalysisPosition(0, 0.15, depth, null, List.of(
