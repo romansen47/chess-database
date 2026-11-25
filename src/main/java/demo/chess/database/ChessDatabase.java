@@ -118,6 +118,26 @@ public interface ChessDatabase {
      */
     void saveAnnotatedPgn(long id, String pgn) throws SQLException;
 
+    /** Stores a completed immutable game-analysis run and makes it active. */
+    default long saveAnalysisRun(AnalysisRun run) throws SQLException {
+        throw new UnsupportedOperationException("Analysis history is not supported");
+    }
+
+    /** Lists completed analysis runs belonging to one canonical game key. */
+    default List<AnalysisRunSummary> findAnalysisRuns(String gameKey) throws SQLException {
+        return List.of();
+    }
+
+    /** Loads one completed analysis run. */
+    default AnalysisRun getAnalysisRun(long id) throws SQLException {
+        throw new UnsupportedOperationException("Analysis history is not supported");
+    }
+
+    /** Selects the run used as the active annotation/evaluation source. */
+    default void setActiveAnalysisRun(String gameKey, long runId) throws SQLException {
+        throw new UnsupportedOperationException("Analysis history is not supported");
+    }
+
     /**
      * Performs a backward-compatible classical position lookup.
      *

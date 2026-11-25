@@ -268,6 +268,57 @@ class SqliteChessDatabaseTest {
         assertTrue(database.findPosition(List.of(), 0).moves().isEmpty());
     }
 
+    @Test
+    void storesImmutableAnalysisRunsAndSwitchesTheActiveRun() throws Exception {
+        SqliteChessDatabase database = new SqliteChessDatabase(
+                tempDirectory.resolve("analysis-history.db"));
+        String gameKey = "518:e2e4 e7e5";
+
+        long firstId = database.saveAnalysisRun(analysisRun(
+                gameKey, "Engine A", "profile-a", 18, 3, 0.35, "g1f3"));
+        long secondId = database.saveAnalysisRun(analysisRun(
+                gameKey, "Engine B", "profile-b", 22, 2, 0.62, "f1c4"));
+
+        List<AnalysisRunSummary> summaries = database.findAnalysisRuns(gameKey);
+        assertEquals(2, summaries.size());
+        assertEquals(secondId, summaries.get(0).id());
+        assertTrue(summaries.get(0).active());
+        assertFalse(summaries.get(1).active());
+
+        AnalysisRun stored = database.getAnalysisRun(firstId);
+        assertEquals("Engine A", stored.engineName());
+        assertEquals(2, stored.positions().size());
+        assertEquals(List.of("g1f3", "b8c6"),
+                stored.positions().get(1).lines().get(0).uciMoves());
+
+        database.setActiveAnalysisRun(gameKey, firstId);
+        summaries = database.findAnalysisRuns(gameKey);
+        assertTrue(summaries.stream().filter(run -> run.id() == firstId)
+                .findFirst().orElseThrow().active());
+        assertFalse(summaries.stream().filter(run -> run.id() == secondId)
+                .findFirst().orElseThrow().active());
+    }
+
+    private AnalysisRun analysisRun(
+            String gameKey,
+            String engine,
+            String profile,
+            int depth,
+            int multiPv,
+            double evaluation,
+            String bestMove) {
+        return new AnalysisRun(
+                0L, gameKey, engine, profile, depth, 5, multiPv, "Threads=2",
+                null, false,
+                List.of(
+                        new AnalysisPosition(0, 0.15, depth, null, List.of(
+                                new AnalysisLine(1, 0.15, depth, null,
+                                        List.of("e2e4", "e7e5")))),
+                        new AnalysisPosition(1, evaluation, depth, null, List.of(
+                                new AnalysisLine(1, evaluation, depth, null,
+                                        List.of(bestMove, "b8c6"))))));
+    }
+
     /**
      * Returns a compact two-game PGN fixture.
      */

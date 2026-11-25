@@ -40,7 +40,7 @@ import demo.chess.save.GameSaver;
 /** SQLite-backed implementation of the local chess database. */
 public class SqliteChessDatabase implements ChessDatabase {
 
-    public static final int SCHEMA_VERSION = 5;
+    public static final int SCHEMA_VERSION = 6;
     public static final int HASH_VERSION = 1;
     public static final int MOVE_CODEC_VERSION = 1;
 
@@ -48,28 +48,20 @@ public class SqliteChessDatabase implements ChessDatabase {
     private final GameLoader gameLoader = new GameLoader();
     private final GameSaver gameSaver = new GameSaver();
     private final SqlitePgnImporter pgnImporter;
+    private final SqliteAnalysisRunStore analysisRunStore;
 
-    /**
-     * Opens or creates the local SQLite chess database at the supplied path.
-     *
-     * @param databasePath database file path
-     * @throws SQLException when schema initialization fails
-     * @throws IOException when the parent directory cannot be created
-     */
+    /** Opens or creates the local SQLite database. */
     public SqliteChessDatabase(Path databasePath) throws SQLException, IOException {
         if (databasePath == null) throw new IllegalArgumentException("databasePath must not be null");
         this.databasePath = databasePath.toAbsolutePath().normalize();
         Path parent = this.databasePath.getParent();
         if (parent != null) Files.createDirectories(parent);
         this.pgnImporter = new SqlitePgnImporter(this.databasePath, gameLoader);
+        this.analysisRunStore = new SqliteAnalysisRunStore(this.databasePath);
         initialize();
     }
 
-    /**
-     * Returns the configured database path or the default path below the user home.
-     *
-     * @return normalized database path
-     */
+    /** Returns the configured path or the default below the user home. */
     public static Path defaultPath() {
         String configured = System.getProperty("chess.database.path");
         if (configured != null && !configured.isBlank()) {
@@ -347,6 +339,26 @@ public class SqliteChessDatabase implements ChessDatabase {
         }
     }
 
+    @Override
+    public long saveAnalysisRun(AnalysisRun run) throws SQLException {
+        return analysisRunStore.save(run);
+    }
+
+    @Override
+    public List<AnalysisRunSummary> findAnalysisRuns(String gameKey) throws SQLException {
+        return analysisRunStore.find(gameKey);
+    }
+
+    @Override
+    public AnalysisRun getAnalysisRun(long id) throws SQLException {
+        return analysisRunStore.get(id);
+    }
+
+    @Override
+    public void setActiveAnalysisRun(String gameKey, long runId) throws SQLException {
+        analysisRunStore.activate(gameKey, runId);
+    }
+
     private StoredMetadata readStoredMetadata(Connection connection, long id) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(
                 """
@@ -566,6 +578,7 @@ public class SqliteChessDatabase implements ChessDatabase {
                         PRIMARY KEY(import_id, hash_hi, hash_lo, move_code)
                     )
                     """);
+            SqliteAnalysisRunStore.createSchema(statement);
             ImportedPgnAnnotations.createSchema(statement);
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_white_player ON game(white_player_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_game_black_player ON game(black_player_id)");
